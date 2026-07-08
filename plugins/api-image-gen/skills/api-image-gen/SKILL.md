@@ -194,7 +194,7 @@ Use `--edit-api responses` or `--image-request-mode openai-responses` only when 
 - Standard Images generation body: JSON with `model`, `prompt`, `size`, and optional `quality`
 - Standard Images edit body: multipart form with `model`, `prompt`, `size`, optional `quality`, and one `image` field per source image
 - Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; top-level `model` is `imageModel`, `tools[0].model` is omitted, and `tools[0].quality` is sent only for `low`, `medium`, or `high`; request mode follows the background -> SSE -> plain JSON fallback chain
-- Response tracing: every API request writes `*_trace.json` plus raw `*.raw.txt` files in the output directory; Responses mode also records response ids when available
+- Response tracing: API requests temporarily write `*_trace.json` plus raw `*.raw.txt` files in the output directory; successful image saves delete the corresponding logs, while failures keep them for troubleshooting. Responses mode also records response ids when available
 - Responses result parsing: final image can come from background/plain JSON `image_generation_call.result`, SSE `response.output_item.done`, or the last partial image event as a fallback
 - Image saving accepts `b64_json`, `base64`, `image_generation_call.result`, common URL fields, nested `result.images`, and image links in Responses `output_text`; if one URL candidate cannot be downloaded, the script tries the next image candidate from the same response
 - Saved PNG dimensions are normalized locally to the requested `size` unless `--no-resize` is used; when resize occurs, `path` points to the `_resized` copy and `originalPath` points to the retained upstream PNG

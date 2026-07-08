@@ -369,7 +369,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 - 图生图默认走 `POST https://api.openai.com/v1/images/edits` multipart，参考图作为 `image` 字段上传
 - 设置 `imageRequestMode: "openai-responses"` 后，文生图和图生图都会走 `POST https://api.openai.com/v1/responses`
 - Responses 请求优先走 `background:true` + 轮询；中转不支持时回退 SSE 流式，再回退普通 JSON 请求
-- 每次 API 请求都会在输出目录记录 `*_trace.json` 和 `*.raw.txt`，用于保留 raw response；Responses 模式还会记录 response id
+- API 请求会临时记录 `*_trace.json` 和 `*.raw.txt`；成功保存图片后会删除对应日志，失败时保留用于排查；Responses 模式还会记录 response id
 - Responses 顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
 - 图片模型默认是 `gpt-image-2`
 - 图片 API 质量默认是 `imageQuality: "auto"`；需要强制质量时可设为 `low`、`medium` 或 `high`

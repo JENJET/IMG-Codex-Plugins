@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -382,15 +382,13 @@ function summarizeApiProfiles(config = {}) {
     return [name, {
       hasKey: !!key,
       keyPreview: key ? previewKey(key) : null,
-      api: {
-        apiRoot: profileConfig.apiRoot,
-        imageRequestMode: profileConfig.imageRequestMode,
-        imageGenerationUrl: profileConfig.imageGenerationUrl,
-        imageEditUrl: profileConfig.imageEditUrl,
-        responsesUrl: profileConfig.responsesUrl,
-        imageModel: profileConfig.imageModel,
-        imageQuality: profileConfig.imageQuality,
-      },
+      apiRoot: profileConfig.apiRoot,
+      imageRequestMode: profileConfig.imageRequestMode,
+      imageGenerationUrl: profileConfig.imageGenerationUrl,
+      imageEditUrl: profileConfig.imageEditUrl,
+      responsesUrl: profileConfig.responsesUrl,
+      imageModel: profileConfig.imageModel,
+      imageQuality: profileConfig.imageQuality,
     }];
   }));
 }
@@ -821,6 +819,7 @@ function createResponseTrace(outputDir, prefix) {
     metadataPath: join(outputDir, `${baseName}_trace.json`),
     responseIds: [],
     files: [],
+    errors: [],
   };
 }
 
@@ -867,7 +866,18 @@ function writeResponseTraceMetadata(trace) {
   writeFileSync(trace.metadataPath, `${JSON.stringify({
     responseIds: trace.responseIds,
     files: trace.files,
+    errors: trace.errors || [],
   }, null, 2)}\n`);
+}
+
+function recordTraceError(trace, error) {
+  if (!trace) return;
+  if (!Array.isArray(trace.errors)) trace.errors = [];
+  trace.errors.push({
+    message: responseTextError(error),
+    at: new Date().toISOString(),
+  });
+  writeResponseTraceMetadata(trace);
 }
 
 function recordRawResponse(trace, stage, raw, meta = {}) {
@@ -897,12 +907,33 @@ function recordRawResponse(trace, stage, raw, meta = {}) {
 
 function responseTraceInfo(trace) {
   if (!trace) return {};
+  writeResponseTraceMetadata(trace);
   const rawFiles = trace.files.map((item) => item.path).filter(Boolean);
   return {
     responseId: trace.responseIds[0] || null,
     responseTracePath: trace.metadataPath,
     rawResponsePath: rawFiles[rawFiles.length - 1] || null,
   };
+}
+
+function deleteResponseTrace(trace) {
+  if (!trace) return;
+  for (const file of trace.files) {
+    if (!file?.path) continue;
+    try {
+      unlinkSync(file.path);
+    } catch {
+      // Best-effort cleanup only; successful image generation should not fail on log deletion.
+    }
+  }
+  if (trace.metadataPath) {
+    try {
+      unlinkSync(trace.metadataPath);
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
+  trace.files = [];
 }
 
 function formatResponseTrace(result) {
@@ -1615,8 +1646,11 @@ async function generateImageViaResponses(apiKey, prompt, size, outputDir, option
     const elapsed = Date.now() - start;
     if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, ...responseTraceInfo(trace) };
     if (saved.error) return { ok: false, elapsed, error: saved.error, ...responseTraceInfo(trace) };
-    return { ok: true, elapsed, ...saved, ...responseTraceInfo(trace) };
+    const { responseId } = responseTraceInfo(trace);
+    deleteResponseTrace(trace);
+    return { ok: true, elapsed, ...saved, responseId };
   } catch (error) {
+    recordTraceError(trace, error);
     return {
       ok: false,
       elapsed: Date.now() - start,
@@ -1641,8 +1675,11 @@ async function generateImageViaImages(apiKey, prompt, size, outputDir, options =
     const elapsed = Date.now() - start;
     if (saved?.error) return { ok: false, elapsed, error: saved.error, ...responseTraceInfo(trace) };
     if (!saved) return { ok: false, elapsed, error: "No image result in Images response", ...responseTraceInfo(trace) };
-    return { ok: true, elapsed, ...saved, ...responseTraceInfo(trace) };
+    const { responseId } = responseTraceInfo(trace);
+    deleteResponseTrace(trace);
+    return { ok: true, elapsed, ...saved, responseId };
   } catch (error) {
+    recordTraceError(trace, error);
     return {
       ok: false,
       elapsed: Date.now() - start,
@@ -1719,8 +1756,11 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
     const elapsed = Date.now() - start;
     if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, sourceName, ...responseTraceInfo(trace) };
     if (saved.error) return { ok: false, elapsed, error: saved.error, sourceName, ...responseTraceInfo(trace) };
-    return { ok: true, elapsed, ...saved, sourceName, ...responseTraceInfo(trace) };
+    const { responseId } = responseTraceInfo(trace);
+    deleteResponseTrace(trace);
+    return { ok: true, elapsed, ...saved, sourceName, responseId };
   } catch (error) {
+    recordTraceError(trace, error);
     return {
       ok: false,
       elapsed: Date.now() - start,
@@ -1747,8 +1787,11 @@ async function editImageViaImagesOnce(apiKey, sources, prompt, size, outputDir, 
     const elapsed = Date.now() - start;
     if (saved?.error) return { ok: false, elapsed, error: saved.error, sourceName, ...responseTraceInfo(trace) };
     if (!saved) return { ok: false, elapsed, error: "No image result in Images edit response", sourceName, ...responseTraceInfo(trace) };
-    return { ok: true, elapsed, ...saved, sourceName, ...responseTraceInfo(trace) };
+    const { responseId } = responseTraceInfo(trace);
+    deleteResponseTrace(trace);
+    return { ok: true, elapsed, ...saved, sourceName, responseId };
   } catch (error) {
+    recordTraceError(trace, error);
     return {
       ok: false,
       elapsed: Date.now() - start,
@@ -2197,10 +2240,10 @@ async function runOpenAIStandardSelfTest() {
   } finally {
     globalThis.fetch = originalFetch;
   }
-  const traceOk = !!generateResult?.responseTracePath
-    && existsSync(generateResult.responseTracePath)
-    && !!editResult?.responseTracePath
-    && existsSync(editResult.responseTracePath);
+  const traceOk = !generateResult?.responseTracePath
+    && !generateResult?.rawResponsePath
+    && !editResult?.responseTracePath
+    && !editResult?.rawResponsePath;
   const saved = await saveImageOutput(imageOutput, outputDir, "self_test_edit");
   const savedOk = !!saved?.path
     && existsSync(saved.path)
@@ -2538,7 +2581,7 @@ async function main() {
       apiProfile: apiConfig.profile || null,
       hasKey: !!activeKey,
       keyPreview: activeKey ? previewKey(activeKey) : null,
-      api: apiConfig,
+      activeApi: apiConfig,
       apis: summarizeApiProfiles(config),
       sizes: config?.sizes || config?.sizeMatrix || null,
       supportedQualities: Object.keys(sizeMatrix),
