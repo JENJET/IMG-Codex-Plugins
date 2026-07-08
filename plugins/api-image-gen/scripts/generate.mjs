@@ -121,12 +121,21 @@ function saveConfig(config, configPath = CONFIG_PATH) {
   writeFileSync(configPath, JSON.stringify(config, null, 2));
 }
 
-function getApiKey(config) {
-  if (!config?.apiKey) {
-    console.error("ERROR: API key is not configured. Run --set-key <key> first.");
+function getApiKey(config, flags = {}) {
+  const apiKey = resolveApiKey(flags, config);
+  if (!apiKey) {
+    const selection = resolveApiProfileSelection(flags, config);
+    const profileNames = Object.keys(apiProfiles(config));
+    if (!selection.name && profileNames.length > 1) {
+      console.error("ERROR: Multiple API profiles are configured. Set defaultApi in the config file or pass --api-profile <name>.");
+      process.exit(1);
+    }
+    const profileText = selection.name ? ` for profile "${selection.name}"` : "";
+    const commandHint = selection.name ? `Run --api-profile ${selection.name} --set-key <key> first.` : "Run --set-key <key> first.";
+    console.error(`ERROR: API key is not configured${profileText}. ${commandHint}`);
     process.exit(1);
   }
-  return config.apiKey;
+  return apiKey;
 }
 
 function normalizeConfigString(value) {
@@ -146,27 +155,69 @@ function resolveConfigPath(flags = {}) {
   return flags.configFile || process.env.API_IMAGE_GEN_CONFIG || CONFIG_PATH;
 }
 
+function apiProfiles(config = {}) {
+  const profiles = config?.apis || config?.apiProfiles;
+  return profiles && typeof profiles === "object" && !Array.isArray(profiles) ? profiles : {};
+}
+
+function apiProfileSettings(profile = {}) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile)) return {};
+  const nested = profile?.api && typeof profile.api === "object" ? profile.api : {};
+  const merged = { ...nested, ...profile };
+  delete merged.api;
+  return merged;
+}
+
+function resolveApiProfileSelection(flags = {}, config = {}) {
+  const profiles = apiProfiles(config);
+  const names = Object.keys(profiles);
+  const requested = normalizeConfigString(flags.apiProfile)
+    || normalizeConfigString(config?.defaultApi)
+    || normalizeConfigString(config?.defaultApiProfile);
+
+  if (requested) {
+    return { name: requested, profile: profiles[requested] || {}, exists: !!profiles[requested] };
+  }
+  if (names.length === 1) {
+    return { name: names[0], profile: profiles[names[0]] || {}, exists: true };
+  }
+  return { name: null, profile: {}, exists: false };
+}
+
 function resolveApiConfig(flags = {}, config = {}) {
+  const selected = apiProfileSettings(resolveApiProfileSelection(flags, config).profile);
   const stored = config?.api || {};
   const apiRoot = normalizeConfigString(flags.apiRoot)
+    || normalizeConfigString(selected.apiRoot)
     || normalizeConfigString(stored.apiRoot)
     || normalizeConfigString(config?.apiRoot)
     || DEFAULT_API_CONFIG.apiRoot;
   return {
+    profile: resolveApiProfileSelection(flags, config).name,
     apiRoot,
     responsesUrl: normalizeConfigString(flags.responsesUrl)
+      || normalizeConfigString(selected.responsesUrl)
       || normalizeConfigString(stored.responsesUrl)
       || normalizeConfigString(config?.responsesUrl)
       || defaultResponsesUrl(apiRoot),
     textModel: normalizeConfigString(flags.textModel)
+      || normalizeConfigString(selected.textModel)
       || normalizeConfigString(stored.textModel)
       || normalizeConfigString(config?.textModel)
       || DEFAULT_API_CONFIG.textModel,
     imageModel: normalizeConfigString(flags.imageModel)
+      || normalizeConfigString(selected.imageModel)
       || normalizeConfigString(stored.imageModel)
       || normalizeConfigString(config?.imageModel)
       || DEFAULT_API_CONFIG.imageModel,
   };
+}
+
+function resolveApiKey(flags = {}, config = {}) {
+  const selected = apiProfileSettings(resolveApiProfileSelection(flags, config).profile);
+  return normalizeConfigString(selected.apiKey)
+    || normalizeConfigString(selected.key)
+    || normalizeConfigString(config?.apiKey);
 }
 
 function hasApiConfigFlag(flags = {}) {
@@ -174,7 +225,12 @@ function hasApiConfigFlag(flags = {}) {
 }
 
 function applyApiConfigFlags(config, flags = {}) {
-  const next = { ...(config?.api || {}) };
+  const profileName = normalizeConfigString(flags.apiProfile);
+  const source = profileName ? apiProfileSettings(apiProfiles(config)[profileName]) : config?.api;
+  const next = { ...(source || {}) };
+  delete next.api;
+  delete next.apiKey;
+  delete next.key;
   if (flags.apiRoot != null) {
     next.apiRoot = normalizeConfigString(flags.apiRoot);
     if (flags.responsesUrl == null) delete next.responsesUrl;
@@ -185,7 +241,44 @@ function applyApiConfigFlags(config, flags = {}) {
   for (const [key, value] of Object.entries(next)) {
     if (!value) delete next[key];
   }
-  return next;
+  if (profileName) {
+    if (!config.apis || typeof config.apis !== "object" || Array.isArray(config.apis)) config.apis = {};
+    config.apis[profileName] = { ...apiProfileSettings(apiProfiles(config)[profileName]), ...next };
+    if (!normalizeConfigString(config.defaultApi)) config.defaultApi = profileName;
+  } else {
+    config.api = next;
+  }
+  return config;
+}
+
+function setApiProfileKey(config, profileName, apiKey) {
+  if (!profileName) {
+    config.apiKey = apiKey;
+    return config;
+  }
+  if (!config.apis || typeof config.apis !== "object" || Array.isArray(config.apis)) config.apis = {};
+  config.apis[profileName] = { ...apiProfileSettings(apiProfiles(config)[profileName]), apiKey };
+  if (!normalizeConfigString(config.defaultApi)) config.defaultApi = profileName;
+  return config;
+}
+
+function summarizeApiProfiles(config = {}) {
+  const profiles = apiProfiles(config);
+  if (Object.keys(profiles).length === 0) return null;
+  return Object.fromEntries(Object.keys(profiles).map((name) => {
+    const profileConfig = resolveApiConfig({ apiProfile: name }, config);
+    const key = resolveApiKey({ apiProfile: name }, config);
+    return [name, {
+      hasKey: !!key,
+      keyPreview: key ? previewKey(key) : null,
+      api: {
+        apiRoot: profileConfig.apiRoot,
+        responsesUrl: profileConfig.responsesUrl,
+        textModel: profileConfig.textModel,
+        imageModel: profileConfig.imageModel,
+      },
+    }];
+  }));
 }
 
 function previewKey(key) {
@@ -1287,6 +1380,8 @@ function parseArgs(argv) {
     if (value === "--config" && argv[i + 1]) args.flags.configFile = argv[++i];
     else if (value === "--get-config") args.flags.getConfig = true;
     else if (value === "--set-key" && argv[i + 1]) args.flags.setKey = argv[++i];
+    else if (value === "--api-profile" && argv[i + 1]) args.flags.apiProfile = argv[++i];
+    else if (value === "--set-default-api" && argv[i + 1]) args.flags.setDefaultApi = argv[++i];
     else if (value === "--set-api-config") args.flags.setApiConfig = true;
     else if (value === "--api-root" && argv[i + 1]) args.flags.apiRoot = argv[++i];
     else if (value === "--responses-url" && argv[i + 1]) args.flags.responsesUrl = argv[++i];
@@ -1342,13 +1437,15 @@ function printUsage(sizeMatrix = resolveSizeMatrix()) {
 CONFIG
   --config path.json
   --get-config
+  --api-profile NAME
   --set-key <key>
-  --set-api-config [--api-root URL] [--responses-url URL] [--text-model MODEL] [--image-model MODEL]
+  --set-default-api NAME
+  --set-api-config [--api-profile NAME] [--api-root URL] [--responses-url URL] [--text-model MODEL] [--image-model MODEL]
   --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--api-root URL|--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--ratio R|--aspect R] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--api-profile NAME] [--api-root URL|--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--ratio R|--aspect R] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
   --batch prompts.json [--ratio R|--aspect R] [--concurrency N] [--no-resize]
   --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--no-resize]
@@ -1422,11 +1519,15 @@ async function main() {
   const sizeMatrix = resolveSizeMatrix(config);
 
   if (flags.getConfig) {
+    const activeKey = resolveApiKey(flags, config);
     console.log(JSON.stringify({
       configPath,
-      hasKey: !!config?.apiKey,
-      keyPreview: config?.apiKey ? previewKey(config.apiKey) : null,
+      defaultApi: normalizeConfigString(config?.defaultApi) || null,
+      apiProfile: apiConfig.profile || null,
+      hasKey: !!activeKey,
+      keyPreview: activeKey ? previewKey(activeKey) : null,
       api: apiConfig,
+      apis: summarizeApiProfiles(config),
       sizes: config?.sizes || config?.sizeMatrix || null,
       supportedQualities: Object.keys(sizeMatrix),
       quickMode: config?.quickMode || null,
@@ -1436,9 +1537,22 @@ async function main() {
   }
 
   if (flags.setKey) {
-    config.apiKey = flags.setKey;
+    setApiProfileKey(config, normalizeConfigString(flags.apiProfile), flags.setKey);
     saveConfig(config, configPath);
-    console.log(`API key saved: ${previewKey(flags.setKey)}`);
+    const profileText = flags.apiProfile ? ` for profile "${flags.apiProfile}"` : "";
+    console.log(`API key saved${profileText}: ${previewKey(flags.setKey)}`);
+    return;
+  }
+
+  if (flags.setDefaultApi) {
+    const profileName = normalizeConfigString(flags.setDefaultApi);
+    if (!apiProfiles(config)[profileName]) {
+      console.error(`ERROR: API profile "${profileName}" does not exist in config.apis.`);
+      process.exit(1);
+    }
+    config.defaultApi = profileName;
+    saveConfig(config, configPath);
+    console.log(`Default API profile saved: ${profileName}`);
     return;
   }
 
@@ -1447,10 +1561,10 @@ async function main() {
       console.error("ERROR: --set-api-config requires at least one of --api-root, --responses-url, --text-model, or --image-model.");
       process.exit(1);
     }
-    config.api = applyApiConfigFlags(config, flags);
+    applyApiConfigFlags(config, flags);
     saveConfig(config, configPath);
     console.log("API config saved:");
-    console.log(JSON.stringify(resolveApiConfig({}, config), null, 2));
+    console.log(JSON.stringify(resolveApiConfig(flags, config), null, 2));
     return;
   }
 
@@ -1515,7 +1629,7 @@ async function main() {
     return;
   }
 
-  const apiKey = getApiKey(config);
+  const apiKey = getApiKey(config, flags);
   const outputDir = resolveOutputDir(flags.outputDir);
 
   if (flags.edit) {

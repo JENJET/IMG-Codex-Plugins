@@ -116,25 +116,38 @@ Image tool model: gpt-image-2
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-root "https://example.com" --text-model "gpt-5.5" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-profile backup
 ```
 
 如果要持久保存到配置文件，可以使用：
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-root "https://example.com" --text-model "gpt-5.5" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile backup --api-root "https://backup.example.com" --text-model "gpt-5.5" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --api-profile backup --set-key "<备用API_KEY>"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-default-api backup
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 ```
 
-也可以直接编辑配置文件里的 `api` 字段：
+也可以直接编辑配置文件。推荐使用 `defaultApi` + `apis` 配置多个 API 档位，`defaultApi` 指定默认使用哪一个：
 
 ```json
 {
-  "apiKey": "你的API_KEY",
-  "api": {
-    "apiRoot": "https://api.openai.com",
-    "responsesUrl": "https://api.openai.com/v1/responses",
-    "textModel": "gpt-5.5",
-    "imageModel": "gpt-image-2"
+  "defaultApi": "openai",
+  "apis": {
+    "openai": {
+      "apiKey": "你的OPENAI_API_KEY",
+      "apiRoot": "https://api.openai.com",
+      "responsesUrl": "https://api.openai.com/v1/responses",
+      "textModel": "gpt-5.5",
+      "imageModel": "gpt-image-2"
+    },
+    "backup": {
+      "apiKey": "你的备用API_KEY",
+      "apiRoot": "https://backup.example.com",
+      "textModel": "gpt-5.5",
+      "imageModel": "gpt-image-2"
+    }
   },
   "sizes": {
     "1K": {
@@ -148,7 +161,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 }
 ```
 
-`responsesUrl` 的优先级高于 `apiRoot`；如果只配置 `apiRoot`，脚本会自动拼接 `/v1/responses`。参数优先级高于配置文件。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。
+`responsesUrl` 的优先级高于 `apiRoot`；如果只配置 `apiRoot`，脚本会自动拼接 `/v1/responses`。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
 
 `sizes` 可以扩展可用尺寸，第一层是质量档位，第二层是你想在 `--aspect` / `--ratio` 里使用的名称，值是实际请求尺寸。上面的例子可以这样使用：
 

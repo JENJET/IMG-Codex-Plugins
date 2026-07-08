@@ -37,15 +37,40 @@ API call defaults are configurable. Use one-off CLI overrides when the user asks
 
 ```bash
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-root "<API_ROOT>" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-profile "<PROFILE_NAME>"
 ```
 
 Persist API call config in the local config file with:
 
 ```bash
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-root "<API_ROOT>" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-profile "<PROFILE_NAME>" --api-root "<API_ROOT>" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --api-profile "<PROFILE_NAME>" --set-key "<USER_KEY>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-default-api "<PROFILE_NAME>"
 ```
 
-The config file can contain an `api` object with `apiRoot`, `responsesUrl`, `textModel`, and `imageModel`. `responsesUrl` overrides `apiRoot`; when only `apiRoot` is configured, the script appends `/v1/responses`. Parameters override the config file. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file.
+The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `responsesUrl`, `textModel`, and `imageModel`. `responsesUrl` overrides `apiRoot`; when only `apiRoot` is configured, the script appends `/v1/responses`. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
+
+```json
+{
+  "defaultApi": "openai",
+  "apis": {
+    "openai": {
+      "apiKey": "<USER_KEY>",
+      "apiRoot": "https://api.openai.com",
+      "responsesUrl": "https://api.openai.com/v1/responses",
+      "textModel": "gpt-5.5",
+      "imageModel": "gpt-image-2"
+    },
+    "backup": {
+      "apiKey": "<BACKUP_KEY>",
+      "apiRoot": "https://backup.example.com",
+      "textModel": "gpt-5.5",
+      "imageModel": "gpt-image-2"
+    }
+  }
+}
+```
 
 The config file can also contain custom sizes under `sizes` or `sizeMatrix`. The first level is the quality name and the second level maps an `--aspect` / `--ratio` label to a concrete `WIDTHxHEIGHT` value:
 
@@ -156,7 +181,7 @@ Do not use `--legacy-edit` or `--edit-api images` here. They are disabled so the
 - Image edit: `POST https://api.openai.com/v1/responses`
 - Responses text model: `gpt-5.5`
 - Image generation tool model: `gpt-image-2`
-- The endpoint and model names above are defaults; the script can override them with CLI flags or the local `api` config object
+- The endpoint and model names above are defaults; the script can override them with CLI flags, `--api-profile`, or the local `defaultApi` / `apis` config
 - Request size policy: use the default preset matrix, `--quality 1K`, or a user-defined config `sizes` entry; do not request 4K, disabled ratios, or arbitrary `--size`
 - Auth: `Authorization: Bearer <API Key>`
 - Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, `store:false`, and `stream:true`
