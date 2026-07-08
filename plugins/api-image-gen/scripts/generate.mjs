@@ -8,8 +8,12 @@ import { spawnSync } from "node:child_process";
 const CONFIG_PATH = join(homedir(), ".codex", "api-image-gen-config.json");
 const DEFAULT_API_CONFIG = {
   apiRoot: "https://api.openai.com",
+  imageRequestMode: "openai",
   responsesPath: "/v1/responses",
+  imageGenerationPath: "/v1/images/generations",
+  imageEditPath: "/v1/images/edits",
   imageModel: "gpt-image-2",
+  imageQuality: "auto",
 };
 const NO_PROMPT_REVISION_INSTRUCTIONS = "You are a tool runner. Pass the user prompt to image_generation VERBATIM. DO NOT rewrite, expand, polish, or revise it in any way. Use the exact text the user gave.";
 
@@ -102,7 +106,17 @@ const DEFAULTS = {
   concurrency: 3,
 };
 const DEFAULT_ENABLED_QUALITIES = new Set(["1K", "2K"]);
+const SUPPORTED_IMAGE_REQUEST_MODES = new Set(["openai", "openai-responses"]);
+const SUPPORTED_IMAGE_QUALITIES = new Set(["auto", "low", "medium", "high"]);
 const API_SIZE_LIMIT_NOTICE = "由于上游请求限制只能接收1K图像，详细计费以后台为准。";
+const LOCKED_IMAGE_REQUEST_MODE_RULES = [
+  {
+    mode: "openai-responses",
+    names: new Set(["fhl", "hfl"]),
+    hosts: new Set(["www.fhl.mom"]),
+    roots: new Set(["https://www.fhl.mom"]),
+  },
+];
 
 const RATIO_ALIASES = {
   square: "1:1",
@@ -146,26 +160,63 @@ function normalizeConfigString(value) {
   return normalized || null;
 }
 
-function normalizeConfigBoolean(value) {
-  if (value === true || value === false) return value;
-  if (value == null) return null;
-  const normalized = String(value).trim().toLowerCase();
-  if (["true", "1", "yes", "on"].includes(normalized)) return true;
-  if (["false", "0", "no", "off"].includes(normalized)) return false;
-  return null;
+function normalizeImageRequestMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["responses", "rs", "openai-rs"].includes(normalized)) return "openai-responses";
+  if (["images", "standard", "openai-standard"].includes(normalized)) return "openai";
+  return SUPPORTED_IMAGE_REQUEST_MODES.has(normalized) ? normalized : null;
+}
+
+function normalizeImageQuality(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return SUPPORTED_IMAGE_QUALITIES.has(normalized) ? normalized : null;
+}
+
+function imageQualityForRequest(apiConfig = {}) {
+  const quality = normalizeImageQuality(apiConfig.imageQuality);
+  return quality && quality !== "auto" ? quality : null;
 }
 
 function stripTrailingSlashes(value) {
   return String(value || "").trim().replace(/\/+$/, "");
 }
 
-function defaultResponsesUrl(apiRoot) {
+function urlHostname(value) {
+  try {
+    return new URL(stripTrailingSlashes(value)).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function lockedImageRequestMode(apiRoot = "", profileName = "") {
+  const name = String(profileName || "").trim().toLowerCase();
+  const root = stripTrailingSlashes(apiRoot).toLowerCase();
+  const host = urlHostname(root);
+  for (const rule of LOCKED_IMAGE_REQUEST_MODE_RULES) {
+    if (rule.names.has(name) || rule.roots.has(root) || (host && rule.hosts.has(host))) return rule.mode;
+  }
+  return null;
+}
+
+function defaultApiPathUrl(apiRoot, path) {
   const base = stripTrailingSlashes(apiRoot || DEFAULT_API_CONFIG.apiRoot);
-  const path = DEFAULT_API_CONFIG.responsesPath;
   for (const prefix of ["/api/v3", "/v1beta", "/v1", "/v2"]) {
     if (base.endsWith(prefix) && path.startsWith(`${prefix}/`)) return `${base}${path.slice(prefix.length)}`;
   }
   return `${base}${path}`;
+}
+
+function defaultResponsesUrl(apiRoot) {
+  return defaultApiPathUrl(apiRoot, DEFAULT_API_CONFIG.responsesPath);
+}
+
+function defaultImageGenerationUrl(apiRoot) {
+  return defaultApiPathUrl(apiRoot, DEFAULT_API_CONFIG.imageGenerationPath);
+}
+
+function defaultImageEditUrl(apiRoot) {
+  return defaultApiPathUrl(apiRoot, DEFAULT_API_CONFIG.imageEditPath);
 }
 
 function resolveConfigPath(flags = {}) {
@@ -202,37 +253,67 @@ function resolveApiProfileSelection(flags = {}, config = {}) {
 }
 
 function resolveApiConfig(flags = {}, config = {}) {
-  const selected = apiProfileSettings(resolveApiProfileSelection(flags, config).profile);
+  const selection = resolveApiProfileSelection(flags, config);
+  const selected = apiProfileSettings(selection.profile);
   const stored = config?.api || {};
   const apiRoot = normalizeConfigString(flags.apiRoot)
     || normalizeConfigString(selected.apiRoot)
     || normalizeConfigString(stored.apiRoot)
     || normalizeConfigString(config?.apiRoot)
     || DEFAULT_API_CONFIG.apiRoot;
-  const textModel = normalizeConfigString(flags.textModel)
-    || normalizeConfigString(selected.textModel)
-    || normalizeConfigString(stored.textModel)
-    || normalizeConfigString(config?.textModel);
-  const imageModelAsTopLevel = normalizeConfigBoolean(flags.imageModelAsTopLevel)
-    ?? normalizeConfigBoolean(selected.imageModelAsTopLevel)
-    ?? normalizeConfigBoolean(stored.imageModelAsTopLevel)
-    ?? normalizeConfigBoolean(config?.imageModelAsTopLevel)
-    ?? false;
+  const imageRequestMode = normalizeImageRequestMode(flags.imageRequestMode)
+    || lockedImageRequestMode(apiRoot, selection.name)
+    || normalizeImageRequestMode(selected.imageRequestMode)
+    || normalizeImageRequestMode(selected.image_request_mode)
+    || normalizeImageRequestMode(stored.imageRequestMode)
+    || normalizeImageRequestMode(stored.image_request_mode)
+    || normalizeImageRequestMode(config?.imageRequestMode)
+    || normalizeImageRequestMode(config?.image_request_mode)
+    || DEFAULT_API_CONFIG.imageRequestMode;
   return {
-    profile: resolveApiProfileSelection(flags, config).name,
+    profile: selection.name,
     apiRoot,
+    imageRequestMode,
+    imageGenerationUrl: normalizeConfigString(flags.imageGenerationUrl)
+      || normalizeConfigString(selected.imageGenerationUrl)
+      || normalizeConfigString(selected.imagesGenerationUrl)
+      || normalizeConfigString(selected.imageGenerationEndpoint)
+      || normalizeConfigString(stored.imageGenerationUrl)
+      || normalizeConfigString(stored.imagesGenerationUrl)
+      || normalizeConfigString(stored.imageGenerationEndpoint)
+      || normalizeConfigString(config?.imageGenerationUrl)
+      || normalizeConfigString(config?.imagesGenerationUrl)
+      || normalizeConfigString(config?.imageGenerationEndpoint)
+      || defaultImageGenerationUrl(apiRoot),
+    imageEditUrl: normalizeConfigString(flags.imageEditUrl)
+      || normalizeConfigString(selected.imageEditUrl)
+      || normalizeConfigString(selected.imagesEditUrl)
+      || normalizeConfigString(selected.imageEditEndpoint)
+      || normalizeConfigString(stored.imageEditUrl)
+      || normalizeConfigString(stored.imagesEditUrl)
+      || normalizeConfigString(stored.imageEditEndpoint)
+      || normalizeConfigString(config?.imageEditUrl)
+      || normalizeConfigString(config?.imagesEditUrl)
+      || normalizeConfigString(config?.imageEditEndpoint)
+      || defaultImageEditUrl(apiRoot),
     responsesUrl: normalizeConfigString(flags.responsesUrl)
       || normalizeConfigString(selected.responsesUrl)
       || normalizeConfigString(stored.responsesUrl)
       || normalizeConfigString(config?.responsesUrl)
       || defaultResponsesUrl(apiRoot),
-    ...(textModel ? { textModel } : {}),
-    imageModelAsTopLevel,
     imageModel: normalizeConfigString(flags.imageModel)
       || normalizeConfigString(selected.imageModel)
       || normalizeConfigString(stored.imageModel)
       || normalizeConfigString(config?.imageModel)
       || DEFAULT_API_CONFIG.imageModel,
+    imageQuality: normalizeImageQuality(flags.imageQuality)
+      || normalizeImageQuality(selected.imageQuality)
+      || normalizeImageQuality(selected.image_quality)
+      || normalizeImageQuality(stored.imageQuality)
+      || normalizeImageQuality(stored.image_quality)
+      || normalizeImageQuality(config?.imageQuality)
+      || normalizeImageQuality(config?.image_quality)
+      || DEFAULT_API_CONFIG.imageQuality,
   };
 }
 
@@ -244,7 +325,7 @@ function resolveApiKey(flags = {}, config = {}) {
 }
 
 function hasApiConfigFlag(flags = {}) {
-  return ["apiRoot", "responsesUrl", "textModel", "imageModel", "imageModelAsTopLevel"].some((key) => flags[key] != null);
+  return ["apiRoot", "imageRequestMode", "imageGenerationUrl", "imageEditUrl", "responsesUrl", "imageModel", "imageQuality"].some((key) => flags[key] != null);
 }
 
 function applyApiConfigFlags(config, flags = {}) {
@@ -254,14 +335,20 @@ function applyApiConfigFlags(config, flags = {}) {
   delete next.api;
   delete next.apiKey;
   delete next.key;
+  delete next.textModel;
+  delete next.imageModelAsTopLevel;
   if (flags.apiRoot != null) {
     next.apiRoot = normalizeConfigString(flags.apiRoot);
+    if (flags.imageGenerationUrl == null) delete next.imageGenerationUrl;
+    if (flags.imageEditUrl == null) delete next.imageEditUrl;
     if (flags.responsesUrl == null) delete next.responsesUrl;
   }
+  if (flags.imageGenerationUrl != null) next.imageGenerationUrl = normalizeConfigString(flags.imageGenerationUrl);
+  if (flags.imageEditUrl != null) next.imageEditUrl = normalizeConfigString(flags.imageEditUrl);
+  if (flags.imageRequestMode != null) next.imageRequestMode = normalizeImageRequestMode(flags.imageRequestMode);
   if (flags.responsesUrl != null) next.responsesUrl = normalizeConfigString(flags.responsesUrl);
-  if (flags.textModel != null) next.textModel = normalizeConfigString(flags.textModel);
   if (flags.imageModel != null) next.imageModel = normalizeConfigString(flags.imageModel);
-  if (flags.imageModelAsTopLevel != null) next.imageModelAsTopLevel = !!flags.imageModelAsTopLevel;
+  if (flags.imageQuality != null) next.imageQuality = normalizeImageQuality(flags.imageQuality);
   for (const [key, value] of Object.entries(next)) {
     if (value == null || value === "") delete next[key];
   }
@@ -297,10 +384,12 @@ function summarizeApiProfiles(config = {}) {
       keyPreview: key ? previewKey(key) : null,
       api: {
         apiRoot: profileConfig.apiRoot,
+        imageRequestMode: profileConfig.imageRequestMode,
+        imageGenerationUrl: profileConfig.imageGenerationUrl,
+        imageEditUrl: profileConfig.imageEditUrl,
         responsesUrl: profileConfig.responsesUrl,
-        ...(profileConfig.textModel ? { textModel: profileConfig.textModel } : {}),
-        imageModelAsTopLevel: profileConfig.imageModelAsTopLevel,
         imageModel: profileConfig.imageModel,
+        imageQuality: profileConfig.imageQuality,
       },
     }];
   }));
@@ -516,6 +605,11 @@ function normalizeBase64Image(value) {
   return comma >= 0 ? value.slice(comma + 1) : value;
 }
 
+function mimeTypeFromDataURL(value) {
+  const match = /^data:([^;,]+)[;,]/i.exec(String(value || ""));
+  return match ? match[1].toLowerCase() : "";
+}
+
 function formatErrorResponse(status, body) {
   if (!body) return `HTTP ${status}`;
   let parsed = null;
@@ -560,6 +654,73 @@ function responsesHeaders(apiKey, accept = "application/json") {
 
 function responseTextError(error, timeoutMs = REQUEST_TIMEOUT_MS) {
   return error?.name === "AbortError" ? `Timeout (${timeoutMs / 1000}s)` : error?.message || String(error);
+}
+
+function imageExtensionFromContentType(contentType) {
+  const type = String(contentType || "").split(";")[0].trim().toLowerCase();
+  if (type === "image/jpeg") return "jpg";
+  if (type === "image/webp") return "webp";
+  if (type === "image/gif") return "gif";
+  return "png";
+}
+
+function imageExtensionFromUrl(url) {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "jpg";
+    if (path.endsWith(".webp")) return "webp";
+    if (path.endsWith(".gif")) return "gif";
+  } catch {
+    // Use PNG as the safest default for image-generation APIs.
+  }
+  return "png";
+}
+
+async function downloadImageOutput(url) {
+  let res;
+  try {
+    res = await requestWithTimeout(url, { method: "GET" }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    return { ok: false, error: responseTextError(error) };
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (!res.ok) {
+    return { ok: false, error: formatErrorResponse(res.status, buffer.toString("utf8").slice(0, 1000)) };
+  }
+  const contentType = res.headers.get("content-type") || "";
+  const extension = contentType.startsWith("image/")
+    ? imageExtensionFromContentType(contentType)
+    : imageExtensionFromUrl(url);
+  return { ok: true, buffer, extension };
+}
+
+async function saveImageOutput(output, outputDir, prefix, index = null, targetSize = null) {
+  if (!output) return null;
+  if (typeof output === "string") return saveBase64Image(output, outputDir, prefix, index, targetSize);
+  if (output.type === "base64" || output.type === "b64") {
+    const extension = imageExtensionForMimeType(output.mimeType || output.mime_type || mimeTypeFromDataURL(output.value));
+    return saveImageBuffer(Buffer.from(normalizeBase64Image(output.value), "base64"), outputDir, prefix, index, targetSize, extension);
+  }
+  if (output.type === "url") {
+    if (String(output.value || "").startsWith("data:image/")) {
+      return saveBase64Image(output.value, outputDir, prefix, index, targetSize);
+    }
+    const downloaded = await downloadImageOutput(output.value);
+    if (!downloaded.ok) return { error: `Image URL download failed: ${downloaded.error}` };
+    return saveImageBuffer(downloaded.buffer, outputDir, prefix, index, targetSize, downloaded.extension);
+  }
+  return null;
+}
+
+async function saveFirstImageOutput(outputs, outputDir, prefix, index = null, targetSize = null) {
+  const candidates = Array.isArray(outputs) ? outputs : [outputs];
+  let lastError = "";
+  for (const output of candidates.filter(Boolean)) {
+    const saved = await saveImageOutput(output, outputDir, prefix, index, targetSize);
+    if (saved && !saved.error) return saved;
+    if (saved?.error) lastError = saved.error;
+  }
+  return lastError ? { error: lastError } : null;
 }
 
 function sleep(ms) {
@@ -614,14 +775,17 @@ function isFatalError(error) {
   ].some((pattern) => text.includes(pattern));
 }
 
-function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = null) {
-  const clean = normalizeBase64Image(base64);
-  if (!clean) return null;
-  const buffer = Buffer.from(clean, "base64");
+function safeImageExtension(extension) {
+  const normalized = String(extension || "png").toLowerCase().replace(/^\./, "");
+  return ["png", "jpg", "jpeg", "webp", "gif"].includes(normalized) ? normalized : "png";
+}
+
+function saveImageBuffer(buffer, outputDir, prefix, index = null, targetSize = null, extension = "png") {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null;
   const suffix = Math.random().toString(36).slice(2, 6);
   const numbered = index == null ? "" : `_${index}`;
   const baseName = `${prefix}_${timestamp()}${numbered}_${suffix}`;
-  const originalPath = join(outputDir, `${baseName}.png`);
+  const originalPath = join(outputDir, `${baseName}.${safeImageExtension(extension)}`);
   const resizedPath = join(outputDir, `${baseName}_resized.png`);
   writeFileSync(originalPath, buffer);
   const resizeInfo = ensurePngTargetSize(originalPath, targetSize, resizedPath);
@@ -639,6 +803,12 @@ function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = n
     originalDimensions: resizeInfo?.originalWidth ? `${resizeInfo.originalWidth}x${resizeInfo.originalHeight}` : null,
     resizeError: resizeInfo?.error || null,
   };
+}
+
+function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = null) {
+  const clean = normalizeBase64Image(base64);
+  if (!clean) return null;
+  return saveImageBuffer(Buffer.from(clean, "base64"), outputDir, prefix, index, targetSize, "png");
 }
 
 function createResponseTrace(outputDir, prefix) {
@@ -756,6 +926,152 @@ function extractImagesFromResponse(data) {
   return items
     .map((item) => item?.b64_json || item?.image?.b64_json || item?.base64)
     .filter((item) => typeof item === "string" && item.trim());
+}
+
+const IMAGE_OUTPUT_KEY_HINTS = [
+  "url",
+  "image_url",
+  "imageUrl",
+  "image",
+  "output_url",
+  "outputUrl",
+  "result_url",
+  "resultUrl",
+  "download_url",
+  "downloadUrl",
+  "asset_url",
+  "assetUrl",
+];
+const IMAGE_CONTAINER_KEY_HINTS = [
+  "images",
+  "image",
+  "output",
+  "outputs",
+  "result",
+  "results",
+  "data",
+  "items",
+  "files",
+  "content",
+  "text",
+  "output_text",
+  "message",
+  "response",
+];
+const IMAGE_BASE64_KEY_HINTS = ["b64_json", "base64", "image_base64", "imageBase64"];
+
+function looksLikeGeneratedImageUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (text.startsWith("data:image/")) return true;
+  if (!/^https?:\/\//i.test(text)) return false;
+  const clean = text.split("?", 1)[0].split("#", 1)[0].toLowerCase();
+  return /\.(png|jpe?g|webp|gif|bmp|tiff?)$/.test(clean);
+}
+
+function imageOutputFromText(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  if (looksLikeGeneratedImageUrl(text)) return { type: "url", value: text };
+  const markdown = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/i.exec(text);
+  if (markdown && looksLikeGeneratedImageUrl(markdown[1])) return { type: "url", value: markdown[1] };
+  const bare = /https?:\/\/[^\s)"'<>]+\.(?:png|jpe?g|webp|gif|bmp|tiff?)(?:\?[^\s)"'<>]*)?/i.exec(text);
+  if (bare) return { type: "url", value: bare[0] };
+  return null;
+}
+
+function addImageOutput(outputs, seen, output) {
+  if (!output?.value) return;
+  const type = output.type === "b64" ? "base64" : output.type;
+  const item = { ...output, type };
+  const key = `${item.type}:${item.value}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  outputs.push(item);
+}
+
+function collectImageOutputs(value, outputs, seen, depth = 0) {
+  if (depth > 8 || value == null) return;
+  if (typeof value === "string") {
+    const output = imageOutputFromText(value);
+    if (output) addImageOutput(outputs, seen, output);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectImageOutputs(item, outputs, seen, depth + 1);
+    return;
+  }
+  if (typeof value !== "object") return;
+
+  const candidates = value.candidates;
+  if (Array.isArray(candidates)) {
+    for (const candidate of candidates) {
+      const parts = candidate?.content?.parts;
+      if (!Array.isArray(parts)) continue;
+      for (const part of parts) {
+        const inline = part?.inlineData || part?.inline_data;
+        const data = inline?.data;
+        if (typeof data === "string" && data.trim()) {
+          addImageOutput(outputs, seen, {
+            type: "base64",
+            value: data.trim(),
+            mimeType: inline?.mimeType || inline?.mime_type || "image/png",
+          });
+        }
+      }
+    }
+  }
+
+  if (value.type === "image_generation_call") {
+    const result = value.result;
+    if (typeof result === "string" && result.trim()) {
+      addImageOutput(outputs, seen, {
+        type: "base64",
+        value: result.trim(),
+        mimeType: value.mime_type || value.mimeType || "image/png",
+      });
+    } else {
+      collectImageOutputs(result, outputs, seen, depth + 1);
+    }
+  }
+
+  for (const key of IMAGE_BASE64_KEY_HINTS) {
+    const item = value[key];
+    if (typeof item === "string" && item.trim()) {
+      addImageOutput(outputs, seen, {
+        type: "base64",
+        value: item.trim(),
+        mimeType: value.mime_type || value.mimeType || "image/png",
+      });
+    }
+  }
+  for (const key of IMAGE_OUTPUT_KEY_HINTS) {
+    collectImageOutputs(value[key], outputs, seen, depth + 1);
+  }
+  for (const key of IMAGE_CONTAINER_KEY_HINTS) {
+    collectImageOutputs(value[key], outputs, seen, depth + 1);
+  }
+}
+
+function extractImageOutputsFromImagesResponse(data) {
+  const outputs = [];
+  collectImageOutputs(data, outputs, new Set());
+  return outputs;
+}
+
+function extractImageOutputsFromResponses(raw) {
+  const outputs = [];
+  const seen = new Set();
+  for (const base64 of extractImagesFromResponses(raw)) {
+    addImageOutput(outputs, seen, { type: "base64", value: base64 });
+  }
+  for (const line of String(raw || "").split(/\r?\n/)) {
+    const event = parseSSEEventLine(line);
+    if (event) collectImageOutputs(event, outputs, seen);
+  }
+  const parsed = parseJsonText(raw);
+  if (parsed) collectImageOutputs(parsed, outputs, seen);
+  return outputs;
 }
 
 function parseSSEEventLine(line) {
@@ -1005,13 +1321,14 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
     type: "image_generation",
     action,
     size,
-    quality: "auto",
     output_format: "png",
     moderation: "low",
     partial_images: parseSizeForAspect(size) ? 0 : 1,
   };
-  if (!apiConfig.imageModelAsTopLevel) tool.model = apiConfig.imageModel;
+  const requestQuality = imageQualityForRequest(apiConfig);
+  if (requestQuality) tool.quality = requestQuality;
   const body = {
+    model: apiConfig.imageModel,
     input: [{
       role: "user",
       content,
@@ -1022,8 +1339,6 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
     store: false,
     instructions: [NO_PROMPT_REVISION_INSTRUCTIONS, aspectInstruction].filter(Boolean).join(" "),
   };
-  if (apiConfig.imageModelAsTopLevel) body.model = apiConfig.imageModel;
-  else if (apiConfig.textModel) body.model = apiConfig.textModel;
   return body;
 }
 
@@ -1033,6 +1348,36 @@ function buildResponsesGenerationBody(prompt, size, apiConfig = resolveApiConfig
 
 function buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig = resolveApiConfig()) {
   return buildResponsesImageBody(prompt, size, "edit", sourceDataURLs, apiConfig);
+}
+
+function promptWithAspectSuffix(prompt, size) {
+  const aspectPromptSuffix = aspectPromptSuffixForSize(size);
+  return aspectPromptSuffix ? `${prompt}\n\n${aspectPromptSuffix}` : prompt;
+}
+
+function buildImagesGenerationBody(prompt, size, apiConfig = resolveApiConfig()) {
+  const body = {
+    model: apiConfig.imageModel,
+    prompt: promptWithAspectSuffix(prompt, size),
+    size,
+  };
+  const requestQuality = imageQualityForRequest(apiConfig);
+  if (requestQuality) body.quality = requestQuality;
+  return body;
+}
+
+function buildImagesEditFormData(prompt, size, sources, apiConfig = resolveApiConfig()) {
+  const formData = new FormData();
+  formData.append("model", apiConfig.imageModel);
+  formData.append("prompt", promptWithAspectSuffix(prompt, size));
+  formData.append("size", size);
+  const requestQuality = imageQualityForRequest(apiConfig);
+  if (requestQuality) formData.append("quality", requestQuality);
+  for (const source of sources || []) {
+    if (!source?.sourceBuffer) continue;
+    formData.append("image", new Blob([source.sourceBuffer], { type: source.mimeType || "image/png" }), source.sourceName || "image.png");
+  }
+  return formData;
 }
 
 function cloneResponsesBody(body) {
@@ -1203,7 +1548,58 @@ async function postOpenAIResponses(apiKey, responsesUrl, body, trace = null) {
   return postOpenAIResponsesPlain(apiKey, responsesUrl, body, trace);
 }
 
-async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
+function imageJsonHeaders(apiKey) {
+  return {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+function imageMultipartHeaders(apiKey) {
+  return {
+    Accept: "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+async function postOpenAIImagesJson(apiKey, url, body, trace = null) {
+  let res;
+  try {
+    res = await requestWithTimeout(url, {
+      method: "POST",
+      headers: imageJsonHeaders(apiKey),
+      body: JSON.stringify(body),
+    }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    return { ok: false, error: responseTextError(error) };
+  }
+
+  const raw = await res.text().catch(() => "");
+  recordRawResponse(trace, "images-generations", raw, { route: "images", httpStatus: res.status });
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "images" };
+  return { ok: true, raw, route: "images" };
+}
+
+async function postOpenAIImagesMultipart(apiKey, url, formData, trace = null) {
+  let res;
+  try {
+    res = await requestWithTimeout(url, {
+      method: "POST",
+      headers: imageMultipartHeaders(apiKey),
+      body: formData,
+    }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    return { ok: false, error: responseTextError(error) };
+  }
+
+  const raw = await res.text().catch(() => "");
+  recordRawResponse(trace, "images-edits", raw, { route: "images", httpStatus: res.status });
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "images" };
+  return { ok: true, raw, route: "images" };
+}
+
+async function generateImageViaResponses(apiKey, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
   const trace = createResponseTrace(outputDir, "response_generate");
@@ -1214,10 +1610,11 @@ async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
     if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, ...responseTraceInfo(trace) };
 
     const raw = response.raw;
-    const [base64] = extractImagesFromResponses(raw);
-    const saved = saveBase64Image(base64, outputDir, "img", null, resize ? size : null);
+    const imageOutputs = extractImageOutputsFromResponses(raw);
+    const saved = await saveFirstImageOutput(imageOutputs, outputDir, "img", null, resize ? size : null);
     const elapsed = Date.now() - start;
     if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, ...responseTraceInfo(trace) };
+    if (saved.error) return { ok: false, elapsed, error: saved.error, ...responseTraceInfo(trace) };
     return { ok: true, elapsed, ...saved, ...responseTraceInfo(trace) };
   } catch (error) {
     return {
@@ -1227,6 +1624,41 @@ async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
       ...responseTraceInfo(trace),
     };
   }
+}
+
+async function generateImageViaImages(apiKey, prompt, size, outputDir, options = {}) {
+  const resize = options.resize !== false;
+  const apiConfig = options.apiConfig || resolveApiConfig();
+  const trace = createResponseTrace(outputDir, "images_generate");
+  const start = Date.now();
+  try {
+    const response = await postOpenAIImagesJson(apiKey, apiConfig.imageGenerationUrl, buildImagesGenerationBody(prompt, size, apiConfig), trace);
+    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, ...responseTraceInfo(trace) };
+
+    const raw = parseJsonText(response.raw);
+    const imageOutputs = extractImageOutputsFromImagesResponse(raw);
+    const saved = await saveFirstImageOutput(imageOutputs, outputDir, "img", null, resize ? size : null);
+    const elapsed = Date.now() - start;
+    if (saved?.error) return { ok: false, elapsed, error: saved.error, ...responseTraceInfo(trace) };
+    if (!saved) return { ok: false, elapsed, error: "No image result in Images response", ...responseTraceInfo(trace) };
+    return { ok: true, elapsed, ...saved, ...responseTraceInfo(trace) };
+  } catch (error) {
+    return {
+      ok: false,
+      elapsed: Date.now() - start,
+      error: responseTextError(error),
+      ...responseTraceInfo(trace),
+    };
+  }
+}
+
+async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
+  const apiConfig = options.apiConfig || resolveApiConfig();
+  const nextOptions = { ...options, apiConfig };
+  if (apiConfig.imageRequestMode === "openai-responses") {
+    return generateImageViaResponses(apiKey, prompt, size, outputDir, nextOptions);
+  }
+  return generateImageViaImages(apiKey, prompt, size, outputDir, nextOptions);
 }
 
 function loadSourceImage(imagePath) {
@@ -1282,10 +1714,39 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
     if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, sourceName, ...responseTraceInfo(trace) };
 
     const raw = response.raw;
-    const [base64] = extractImagesFromResponses(raw);
-    const saved = saveBase64Image(base64, outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
+    const imageOutputs = extractImageOutputsFromResponses(raw);
+    const saved = await saveFirstImageOutput(imageOutputs, outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
     const elapsed = Date.now() - start;
     if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, sourceName, ...responseTraceInfo(trace) };
+    if (saved.error) return { ok: false, elapsed, error: saved.error, sourceName, ...responseTraceInfo(trace) };
+    return { ok: true, elapsed, ...saved, sourceName, ...responseTraceInfo(trace) };
+  } catch (error) {
+    return {
+      ok: false,
+      elapsed: Date.now() - start,
+      error: responseTextError(error),
+      sourceName,
+      ...responseTraceInfo(trace),
+    };
+  }
+}
+
+async function editImageViaImagesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
+  const resize = options.resize !== false;
+  const apiConfig = options.apiConfig || resolveApiConfig();
+  const trace = createResponseTrace(outputDir, "images_edit");
+  const start = Date.now();
+  const sourceName = summarizeSources(sources);
+  try {
+    const response = await postOpenAIImagesMultipart(apiKey, apiConfig.imageEditUrl, buildImagesEditFormData(prompt, size, sources, apiConfig), trace);
+    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, sourceName, ...responseTraceInfo(trace) };
+
+    const raw = parseJsonText(response.raw);
+    const imageOutputs = extractImageOutputsFromImagesResponse(raw);
+    const saved = await saveFirstImageOutput(imageOutputs, outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
+    const elapsed = Date.now() - start;
+    if (saved?.error) return { ok: false, elapsed, error: saved.error, sourceName, ...responseTraceInfo(trace) };
+    if (!saved) return { ok: false, elapsed, error: "No image result in Images edit response", sourceName, ...responseTraceInfo(trace) };
     return { ok: true, elapsed, ...saved, sourceName, ...responseTraceInfo(trace) };
   } catch (error) {
     return {
@@ -1322,6 +1783,9 @@ async function editImage(apiKey, imagePaths, prompt, size, outputDir, count = 1,
   const failures = [];
   let retryCount = 0;
   const apiConfig = options.apiConfig || resolveApiConfig();
+  const editOnce = apiConfig.imageRequestMode === "openai-responses"
+    ? editImageViaResponsesOnce
+    : editImageViaImagesOnce;
   for (let index = 0; index < count; index += 1) {
     const result = await generateWithRetry(apiKey, prompt, size, outputDir, {
       index,
@@ -1329,7 +1793,7 @@ async function editImage(apiKey, imagePaths, prompt, size, outputDir, count = 1,
       maxRetries: options.maxRetries ?? MAX_RETRIES,
       retryDelayMs: options.retryDelayMs ?? RETRY_BACKOFF_MS,
       resize,
-      generator: (_apiKey, _prompt, _size, _outputDir, context) => editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, {
+      generator: (_apiKey, _prompt, _size, _outputDir, context) => editOnce(apiKey, sources, prompt, size, outputDir, {
         resize,
         saveIndex: count > 1 ? context.index + 1 : null,
         apiConfig,
@@ -1637,8 +2101,8 @@ async function runAdaptiveSelfTest() {
   return 0;
 }
 
-async function runEditResponsesSelfTest() {
-  console.log("Edit Responses self-test: payload shape and SSE extraction.");
+async function runOpenAIStandardSelfTest() {
+  console.log("OpenAI standard Images self-test: payload shape and result extraction.");
   const sources = [
     {
       sourceName: "mock-a.png",
@@ -1655,52 +2119,167 @@ async function runEditResponsesSelfTest() {
       dataURL: "data:image/jpeg;base64,bW9jay1zb3VyY2UtYg==",
     },
   ];
-  const apiConfig = resolveApiConfig();
+  const apiConfig = resolveApiConfig({ imageQuality: "high" });
   const explicitSizeOk = normalizeSizeString("2048x1024") === "2048x1024"
     && normalizeSizeString("2048X1024") === "2048x1024"
     && normalizeSizeString("2048*1024") === "2048x1024"
     && normalizeSizeString("2048×1024") === "2048x1024"
     && resolveGenerationParams({ size: "2048*1024" }, null).size === "2048x1024";
+  const generationBody = buildImagesGenerationBody("mock generate prompt", "2048x1024", apiConfig);
+  const formData = buildImagesEditFormData("mock edit prompt", "1152x2048", sources, apiConfig);
+  const payloadOk = defaultImageGenerationUrl("https://api.mikoto.vip") === "https://api.mikoto.vip/v1/images/generations"
+    && defaultImageEditUrl("https://api.mikoto.vip/v1") === "https://api.mikoto.vip/v1/images/edits"
+    && generationBody.model === apiConfig.imageModel
+    && generationBody.quality === "high"
+    && generationBody.prompt.includes("2048x1024")
+    && formData.get("model") === apiConfig.imageModel
+    && formData.get("quality") === "high"
+    && String(formData.get("prompt") || "").includes("1152x2048")
+    && formData.get("size") === "1152x2048"
+    && formData.getAll("image").length === 2;
+
+  const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const [imageOutput] = extractImageOutputsFromImagesResponse({ data: [{ b64_json: pngB64 }] });
+  const flexibleOutputs = extractImageOutputsFromImagesResponse({
+    result: { images: [{ url: ["https://example.com/result.png"] }] },
+  });
+  const flexibleOk = flexibleOutputs.some((item) => item.type === "url" && item.value === "https://example.com/result.png");
+  const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  let requestOk = false;
+  let generateResult = null;
+  let editResult = null;
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      let parsedBody = null;
+      if (init.body instanceof FormData) {
+        parsedBody = {
+          model: init.body.get("model"),
+          size: init.body.get("size"),
+          quality: init.body.get("quality"),
+          imageCount: init.body.getAll("image").length,
+        };
+      } else if (init.body) {
+        parsedBody = JSON.parse(init.body);
+      }
+      fetchCalls.push({ url: String(url), method: init.method, body: parsedBody });
+      return new Response(JSON.stringify({ data: [{ b64_json: pngB64 }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const testApiConfig = {
+      ...apiConfig,
+      imageRequestMode: "openai",
+      imageGenerationUrl: "https://example.com/v1/images/generations",
+      imageEditUrl: "https://example.com/v1/images/edits",
+      imageQuality: "medium",
+    };
+    generateResult = await generateImage("mock-key", "mock generate prompt", "2048x1024", outputDir, {
+      apiConfig: testApiConfig,
+      resize: false,
+    });
+    editResult = await editImageViaImagesOnce("mock-key", sources, "mock edit prompt", "1152x2048", outputDir, {
+      apiConfig: testApiConfig,
+      resize: false,
+    });
+    requestOk = generateResult.ok
+      && editResult.ok
+      && fetchCalls.length === 2
+      && fetchCalls[0].url.endsWith("/v1/images/generations")
+      && fetchCalls[0].body?.model === apiConfig.imageModel
+      && fetchCalls[0].body?.quality === "medium"
+      && fetchCalls[1].url.endsWith("/v1/images/edits")
+      && fetchCalls[1].body?.model === apiConfig.imageModel
+      && fetchCalls[1].body?.quality === "medium"
+      && fetchCalls[1].body?.imageCount === 2;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const traceOk = !!generateResult?.responseTracePath
+    && existsSync(generateResult.responseTracePath)
+    && !!editResult?.responseTracePath
+    && existsSync(editResult.responseTracePath);
+  const saved = await saveImageOutput(imageOutput, outputDir, "self_test_edit");
+  const savedOk = !!saved?.path
+    && existsSync(saved.path)
+    && saved.width === 1
+    && saved.height === 1;
+  const resizedSaved = saveBase64Image(pngB64, outputDir, "self_test_resize", null, "2x2");
+  const resizePreserveOk = process.platform === "win32"
+    ? !!resizedSaved?.path
+      && existsSync(resizedSaved.path)
+      && !!resizedSaved.originalPath
+      && existsSync(resizedSaved.originalPath)
+      && resizedSaved.path !== resizedSaved.originalPath
+      && resizedSaved.path.endsWith("_resized.png")
+      && resizedSaved.width === 2
+      && resizedSaved.height === 2
+      && resizedSaved.originalDimensions === "1x1"
+    : !!resizedSaved?.path
+      && existsSync(resizedSaved.path)
+      && resizedSaved.width === 1
+      && resizedSaved.height === 1
+      && !!resizedSaved.resizeError;
+
+  if (!explicitSizeOk || !payloadOk || !flexibleOk || !requestOk || !traceOk || !savedOk || !resizePreserveOk) {
+    console.error("OpenAI standard Images self-test FAILED.");
+    console.error(JSON.stringify({
+      explicitSizeOk,
+      payloadOk,
+      flexibleOk,
+      requestOk,
+      traceOk,
+      fetchCalls,
+      generateResult,
+      editResult,
+      savedOk,
+      resizePreserveOk,
+      saved,
+      resizedSaved,
+    }, null, 2));
+    return 1;
+  }
+
+  console.log("OpenAI standard Images self-test OK.");
+  console.log(`Saved: ${saved.path}`);
+  return 0;
+}
+
+async function runResponsesSelfTest() {
+  console.log("OpenAI Responses self-test: payload shape and fallback chain.");
+  const sources = [
+    {
+      sourceName: "mock-a.png",
+      sourceBuffer: Buffer.from("mock-source-a"),
+      mimeType: "image/png",
+      ext: "png",
+      dataURL: "data:image/png;base64,bW9jay1zb3VyY2UtYQ==",
+    },
+    {
+      sourceName: "mock-b.jpg",
+      sourceBuffer: Buffer.from("mock-source-b"),
+      mimeType: "image/jpeg",
+      ext: "jpg",
+      dataURL: "data:image/jpeg;base64,bW9jay1zb3VyY2UtYg==",
+    },
+  ];
+  const apiConfig = resolveApiConfig({ imageRequestMode: "openai-responses", imageQuality: "high" });
   const payload = buildResponsesEditBody("mock edit prompt", "1152x2048", sources.map((item) => item.dataURL), apiConfig);
-  const explicitModelPayload = buildResponsesEditBody(
-    "mock edit prompt",
-    "1152x2048",
-    sources.map((item) => item.dataURL),
-    { ...apiConfig, textModel: "mock-text-model" },
-  );
-  const topLevelImagePayload = buildResponsesEditBody(
-    "mock edit prompt",
-    "1152x2048",
-    sources.map((item) => item.dataURL),
-    { ...apiConfig, imageModelAsTopLevel: true },
-  );
   const content = payload.input?.[0]?.content || [];
   const tool = payload.tools?.[0] || {};
-  const modelOk = apiConfig.imageModelAsTopLevel
-    ? payload.model === apiConfig.imageModel && !Object.prototype.hasOwnProperty.call(tool, "model")
-    : tool.model === apiConfig.imageModel
-      && (apiConfig.textModel
-        ? payload.model === apiConfig.textModel
-        : !Object.prototype.hasOwnProperty.call(payload, "model"));
-  const topLevelImageOk = topLevelImagePayload.model === apiConfig.imageModel
-    && !Object.prototype.hasOwnProperty.call(topLevelImagePayload.tools?.[0] || {}, "model");
-  const cloneOk = !Object.prototype.hasOwnProperty.call(cloneResponsesBody({ ...payload, stream: true, background: true }), "stream")
-    && !Object.prototype.hasOwnProperty.call(cloneResponsesBody({ ...payload, stream: true, background: true }), "background");
-  const payloadOk = modelOk
-    && topLevelImageOk
-    && explicitModelPayload.model === (apiConfig.imageModelAsTopLevel ? apiConfig.imageModel : "mock-text-model")
+  const payloadOk = payload.model === apiConfig.imageModel
+    && !Object.prototype.hasOwnProperty.call(tool, "model")
     && !Object.prototype.hasOwnProperty.call(payload, "stream")
     && payload.store === false
     && content[0]?.type === "input_text"
     && content[1]?.type === "input_image"
-    && content[1]?.image_url === sources[0].dataURL
     && content[2]?.type === "input_image"
-    && content[2]?.image_url === sources[1].dataURL
     && tool.type === "image_generation"
     && tool.action === "edit"
     && tool.size === "1152x2048"
-    && tool.output_format === "png"
-    && tool.partial_images === 0
+    && tool.quality === "high"
     && payload.tool_choice?.type === "image_generation";
 
   const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
@@ -1712,6 +2291,10 @@ async function runEditResponsesSelfTest() {
     output: [{ type: "image_generation_call", result: pngB64 }],
   }));
   const [partialBase64] = extractImagesFromResponses(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"${pngB64}"}\n`);
+  const [textUrlOutput] = extractImageOutputsFromResponses(JSON.stringify({
+    output_text: "![result](https://example.com/result.png)",
+  }));
+  const textFallbackOk = textUrlOutput?.type === "url" && textUrlOutput.value === "https://example.com/result.png";
   const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
   const trace = createResponseTrace(outputDir, "self_test_response");
   const originalFetch = globalThis.fetch;
@@ -1747,49 +2330,30 @@ async function runEditResponsesSelfTest() {
     && trace.files.length === 2
     && trace.responseIds.includes("resp_mock_trace")
     && trace.files.every((item) => existsSync(item.path));
-  const saved = saveBase64Image(base64, outputDir, "self_test_edit");
+  const saved = saveBase64Image(base64, outputDir, "self_test_response");
   const savedOk = !!saved?.path
     && existsSync(saved.path)
     && saved.width === 1
     && saved.height === 1
     && jsonBase64 === pngB64
     && partialBase64 === pngB64;
-  const resizedSaved = saveBase64Image(base64, outputDir, "self_test_resize", null, "2x2");
-  const resizePreserveOk = process.platform === "win32"
-    ? !!resizedSaved?.path
-      && existsSync(resizedSaved.path)
-      && !!resizedSaved.originalPath
-      && existsSync(resizedSaved.originalPath)
-      && resizedSaved.path !== resizedSaved.originalPath
-      && resizedSaved.path.endsWith("_resized.png")
-      && resizedSaved.width === 2
-      && resizedSaved.height === 2
-      && resizedSaved.originalDimensions === "1x1"
-    : !!resizedSaved?.path
-      && existsSync(resizedSaved.path)
-      && resizedSaved.width === 1
-      && resizedSaved.height === 1
-      && !!resizedSaved.resizeError;
 
-  if (!explicitSizeOk || !payloadOk || !cloneOk || !fallbackOk || !traceOk || !savedOk || !resizePreserveOk) {
-    console.error("Edit Responses self-test FAILED.");
+  if (!payloadOk || !textFallbackOk || !fallbackOk || !traceOk || !savedOk) {
+    console.error("OpenAI Responses self-test FAILED.");
     console.error(JSON.stringify({
-      explicitSizeOk,
       payloadOk,
-      cloneOk,
+      textFallbackOk,
       fallbackOk,
       traceOk,
       trace,
       fetchCalls,
       savedOk,
-      resizePreserveOk,
       saved,
-      resizedSaved,
     }, null, 2));
     return 1;
   }
 
-  console.log("Edit Responses self-test OK.");
+  console.log("OpenAI Responses self-test OK.");
   console.log(`Saved: ${saved.path}`);
   return 0;
 }
@@ -1806,11 +2370,14 @@ function parseArgs(argv) {
     else if (value === "--set-default-api" && argv[i + 1]) args.flags.setDefaultApi = argv[++i];
     else if (value === "--set-api-config") args.flags.setApiConfig = true;
     else if (value === "--api-root" && argv[i + 1]) args.flags.apiRoot = argv[++i];
+    else if (value === "--image-request-mode" && argv[i + 1]) args.flags.imageRequestMode = argv[++i];
+    else if (value === "--openai-standard") args.flags.imageRequestMode = "openai";
+    else if (value === "--openai-responses") args.flags.imageRequestMode = "openai-responses";
+    else if (value === "--image-generation-url" && argv[i + 1]) args.flags.imageGenerationUrl = argv[++i];
+    else if (value === "--image-edit-url" && argv[i + 1]) args.flags.imageEditUrl = argv[++i];
     else if (value === "--responses-url" && argv[i + 1]) args.flags.responsesUrl = argv[++i];
-    else if (value === "--text-model" && i + 1 < argv.length) args.flags.textModel = argv[++i];
     else if (value === "--image-model" && argv[i + 1]) args.flags.imageModel = argv[++i];
-    else if (value === "--image-model-as-top-level") args.flags.imageModelAsTopLevel = true;
-    else if (value === "--no-image-model-as-top-level") args.flags.imageModelAsTopLevel = false;
+    else if (value === "--image-quality" && argv[i + 1]) args.flags.imageQuality = argv[++i];
     else if (value === "--set-quick-mode") args.flags.setQuickMode = true;
     else if (value === "--set-batch-mode") args.flags.setBatchMode = true;
     else if (value === "--prompt" && argv[i + 1]) args.prompts.push(argv[++i]);
@@ -1838,17 +2405,20 @@ function parseArgs(argv) {
     else if (value === "--batch-edit") args.flags.batchEdit = true;
     else if (value === "--legacy-edit") {
       args.flags.edit = true;
-      args.flags.unsupportedEditRoute = "legacy-edit";
+      args.flags.imageRequestMode = "openai";
     } else if (value === "--edit-api" && argv[i + 1]) {
       const route = String(argv[++i]).trim().toLowerCase();
-      if (route && route !== "responses") args.flags.unsupportedEditRoute = `edit-api:${route}`;
+      const mode = normalizeImageRequestMode(route);
+      if (mode) args.flags.imageRequestMode = mode;
+      else args.flags.unsupportedEditRoute = `edit-api:${route}`;
     }
     else if (value === "--image" && argv[i + 1]) {
       if (!args.flags.images) args.flags.images = [];
       args.flags.images.push(argv[++i]);
     } else if (value === "--resolve-size") args.flags.resolveSize = true;
     else if (value === "--self-test-adaptive") args.flags.selfTestAdaptive = true;
-    else if (value === "--self-test-edit-responses") args.flags.selfTestEditResponses = true;
+    else if (value === "--self-test-openai-standard") args.flags.selfTestOpenAIStandard = true;
+    else if (value === "--self-test-responses" || value === "--self-test-edit-responses") args.flags.selfTestResponses = true;
     else if (value === "--help" || value === "-h") args.flags.help = true;
     i++;
   }
@@ -1864,37 +2434,41 @@ CONFIG
   --api-profile NAME
   --set-key <key>
   --set-default-api NAME
-  --set-api-config [--api-profile NAME] [--api-root URL] [--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--image-model-as-top-level|--no-image-model-as-top-level]
+  --set-api-config [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--image-model MODEL] [--image-quality auto|low|medium|high]
+  --set-api-config [--image-generation-url URL] [--image-edit-url URL] [--responses-url URL]
   --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--api-profile NAME] [--api-root URL|--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--image-model-as-top-level] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--image-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
   --batch prompts.json [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
   --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
-  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one Responses edit request
+  --edit --image path.png --prompt "..." [--image-request-mode openai|openai-responses] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
+  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one edit request
   --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
-  image-to-image route is fixed to Responses API; --legacy-edit and --edit-api images are disabled
+  default route is OpenAI standard Images API; use --edit-api responses for Responses/RS
 
 TOOLS
   --resolve-size --quality 2K --aspect 16:9
   --resolve-size --size 2048*1024
   --self-test-adaptive
-  --self-test-edit-responses
+  --self-test-openai-standard
+  --self-test-responses
 
 DEFAULTS
   config: ${CONFIG_PATH} or API_IMAGE_GEN_CONFIG
   API root: ${DEFAULT_API_CONFIG.apiRoot}
+  image request mode: ${DEFAULT_API_CONFIG.imageRequestMode}
+  image generation URL: ${defaultImageGenerationUrl(DEFAULT_API_CONFIG.apiRoot)}
+  image edit URL: ${defaultImageEditUrl(DEFAULT_API_CONFIG.apiRoot)}
   responses URL: ${defaultResponsesUrl(DEFAULT_API_CONFIG.apiRoot)}
-  text model: not sent unless textModel is configured
   image model: ${DEFAULT_API_CONFIG.imageModel}
-  image model as top-level: off
-  edit API: responses only
-  request quality: default ${DEFAULTS.quality}; supported ${Object.keys(sizeMatrix).join(", ")}
+  image API quality: ${DEFAULT_API_CONFIG.imageQuality} (auto is not sent; low/medium/high are sent)
+  edit API: openai standard by default; openai-responses optional
+  size preset: default ${DEFAULTS.quality}; supported ${Object.keys(sizeMatrix).join(", ")}
   output: ~/Pictures/api-image-gen
   adaptive: on, concurrency ${DEFAULTS.concurrency}, retries ${MAX_RETRIES}, retry backoff ${RETRY_BACKOFF_MS / 1000}s
   notice: ${API_SIZE_LIMIT_NOTICE}
@@ -1945,6 +2519,14 @@ async function main() {
   const { prompts, flags } = parseArgs(process.argv.slice(2));
   const configPath = resolveConfigPath(flags);
   const config = loadConfig(configPath) || {};
+  if (flags.imageRequestMode != null && !normalizeImageRequestMode(flags.imageRequestMode)) {
+    console.error(`ERROR: Invalid image request mode="${flags.imageRequestMode}". Use openai or openai-responses.`);
+    process.exit(1);
+  }
+  if (flags.imageQuality != null && !normalizeImageQuality(flags.imageQuality)) {
+    console.error(`ERROR: Invalid image quality="${flags.imageQuality}". Use auto, low, medium, or high.`);
+    process.exit(1);
+  }
   const apiConfig = resolveApiConfig(flags, config);
   const sizeMatrix = resolveSizeMatrix(config);
 
@@ -1988,7 +2570,7 @@ async function main() {
 
   if (flags.setApiConfig) {
     if (!hasApiConfigFlag(flags)) {
-      console.error("ERROR: --set-api-config requires at least one of --api-root, --responses-url, --text-model, --image-model, --image-model-as-top-level, or --no-image-model-as-top-level.");
+      console.error("ERROR: --set-api-config requires at least one of --api-root, --image-request-mode, --image-generation-url, --image-edit-url, --responses-url, --image-model, or --image-quality.");
       process.exit(1);
     }
     applyApiConfigFlags(config, flags);
@@ -2049,8 +2631,13 @@ async function main() {
     return;
   }
 
-  if (flags.selfTestEditResponses) {
-    process.exitCode = await runEditResponsesSelfTest();
+  if (flags.selfTestOpenAIStandard) {
+    process.exitCode = await runOpenAIStandardSelfTest();
+    return;
+  }
+
+  if (flags.selfTestResponses) {
+    process.exitCode = await runResponsesSelfTest();
     return;
   }
 
@@ -2077,7 +2664,7 @@ async function main() {
       process.exit(1);
     }
     if (flags.unsupportedEditRoute) {
-      console.error("ERROR: Image-to-image is fixed to Responses API with input_image blocks. --legacy-edit and --edit-api images are disabled in this plugin.");
+      console.error(`ERROR: Unsupported edit API route "${flags.unsupportedEditRoute}". Use --edit-api images or --edit-api responses.`);
       process.exit(1);
     }
     const { size } = resolveGenerationParams(flags, config.quickMode, sizeMatrix);

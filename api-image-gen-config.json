@@ -4,19 +4,23 @@
     "openai": {
       "apiKey": "你的OPENAI_API_KEY",
       "apiRoot": "https://api.openai.com",
-      "imageModel": "gpt-image-2"
+      "imageRequestMode": "openai",
+      "imageModel": "gpt-image-2",
+      "imageQuality": "auto"
     },
     "manxiaobai": {
       "apiKey": "你的MANXIAOBAI_API_KEY",
       "apiRoot": "https://api.manxiaobai.online",
+      "imageRequestMode": "openai",
       "imageModel": "gpt-image-2",
-      "imageModelAsTopLevel": true
+      "imageQuality": "auto"
     },
     "mikotopro": {
       "apiKey": "你的MIKOTO_API_KEY",
       "apiRoot": "https://api.mikoto.vip",
+      "imageRequestMode": "openai",
       "imageModel": "gpt-image-2",
-      "imageModelAsTopLevel": true
+      "imageQuality": "auto"
     }
   },
   "sizes": {

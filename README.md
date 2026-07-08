@@ -21,7 +21,7 @@ codex plugin add api-image-gen@img-gen-plugins
 
 目前仓库里提供的插件是：
 
-- `api-image-gen`：基于 Responses API 的文生图 / 图生图插件，支持固定比例、批量生图、多参考图图生图、连续出图和自适应并发。
+- `api-image-gen`：默认基于 OpenAI 标准 Images API 的文生图 / 图生图插件，同时兼容 Responses / OpenAI RS 模式，支持固定比例、批量生图、多参考图图生图、连续出图和自适应并发。
 
 ## 安装前准备
 
@@ -107,30 +107,36 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --get-config
 
 ```text
 API root: https://api.openai.com
-Responses URL: https://api.openai.com/v1/responses
-Text model: 不配置或为空字符串则不发送
-Image tool model: gpt-image-2
+Image request mode: openai
+Image generation URL: https://api.openai.com/v1/images/generations
+Image edit URL: https://api.openai.com/v1/images/edits
+Responses URL: https://api.openai.com/v1/responses（仅 openai-responses 模式使用）
+Image model: gpt-image-2
+Image quality: auto
 ```
 
 如果需要临时覆盖，可以直接传参数：
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-root "https://example.com" --image-model "gpt-image-2"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --text-model "<TEXT_MODEL>"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --image-quality high
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-profile manxiaobai
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --image-request-mode openai-responses
 ```
 
 如果要持久保存到配置文件，可以使用：
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-root "https://example.com" --image-model "gpt-image-2"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai --api-root "https://api.manxiaobai.online" --image-model "gpt-image-2" --image-model-as-top-level
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --image-quality high
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai --api-root "https://api.manxiaobai.online" --image-request-mode openai --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai-rs --api-root "https://api.manxiaobai.online" --image-request-mode openai-responses --image-model "gpt-image-2"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --api-profile manxiaobai --set-key "<MANXIAOBAI_API_KEY>"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-default-api manxiaobai
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 ```
 
-`textModel` 可以省略，也可以设为空字符串；这两种情况下默认不会发送 Responses 顶层 `model` 字段。只有 `textModel` 是非空字符串且没有启用 `imageModelAsTopLevel` 时，才会作为顶层 `model` 发送。启用 `imageModelAsTopLevel` 时，顶层 `model` 改用 `imageModel`。
+默认 `imageRequestMode` 是 `openai`，也就是标准 Images API。`imageQuality` 支持 `auto`、`low`、`medium`、`high`；`auto` 不显式发送质量字段，`low/medium/high` 会写进请求。进入 `openai-responses` 模式后，请求形状和 Infinite-Canvas 的 OpenAI RS 一致：Responses 顶层 `model` 使用 `imageModel`，`tools[0]` 不再单独发送模型。
 
 也可以直接编辑配置文件。推荐使用 `defaultApi` + `apis` 配置多个 API 档位，`defaultApi` 指定默认使用哪一个：
 
@@ -141,19 +147,30 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
     "openai": {
       "apiKey": "你的OPENAI_API_KEY",
       "apiRoot": "https://api.openai.com",
-      "imageModel": "gpt-image-2"
+      "imageRequestMode": "openai",
+      "imageModel": "gpt-image-2",
+      "imageQuality": "auto"
     },
     "manxiaobai": {
       "apiKey": "你的MANXIAOBAI_API_KEY",
       "apiRoot": "https://api.manxiaobai.online",
+      "imageRequestMode": "openai",
       "imageModel": "gpt-image-2",
-      "imageModelAsTopLevel": true
+      "imageQuality": "auto"
     },
     "mikotopro": {
       "apiKey": "你的MIKOTO_API_KEY",
       "apiRoot": "https://api.mikoto.vip",
+      "imageRequestMode": "openai",
       "imageModel": "gpt-image-2",
-      "imageModelAsTopLevel": true
+      "imageQuality": "auto"
+    },
+    "mikotopro-rs": {
+      "apiKey": "你的MIKOTO_API_KEY",
+      "apiRoot": "https://api.mikoto.vip",
+      "imageRequestMode": "openai-responses",
+      "imageModel": "gpt-image-2",
+      "imageQuality": "high"
     }
   },
   "sizes": {
@@ -169,7 +186,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 }
 ```
 
-示例里不要写真实 API Key。`responsesUrl` 可以不配；如果只配置 `apiRoot`，脚本会自动拼接 `/v1/responses`，如果 `apiRoot` 已经以 `/v1` 结尾则只补 `/responses`。Infinite-Canvas 风格的 OpenAI RS 中转建议设置 `imageModelAsTopLevel: true`，此时顶层 `model` 使用 `imageModel`，`textModel` 不参与图片请求。`responsesUrl` 的优先级高于 `apiRoot`，只在中转路径不是 `/v1/responses` 时才需要手动覆盖。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
+示例里不要写真实 API Key。`imageRequestMode: "openai"` 会按 OpenAI 标准 Images API 请求：文生图自动拼接 `/v1/images/generations`，图生图自动拼接 `/v1/images/edits`。如果 `apiRoot` 已经以 `/v1` 结尾，则只补后面的 `/images/...` 路径。`imageRequestMode: "openai-responses"` 会走 `/v1/responses`，适合 Infinite-Canvas 风格 OpenAI RS 中转；这时才会使用 `responsesUrl`。`imageQuality` 的优先级也遵循参数高于配置文件，配置值可以写 `auto`、`low`、`medium`、`high`。`imageGenerationUrl`、`imageEditUrl`、`responsesUrl` 的优先级都高于 `apiRoot`，只在中转路径不是标准路径时才需要手动覆盖。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
 
 `sizes` 可以扩展可用尺寸，第一层是质量档位，第二层是你想在 `--aspect` / `--ratio` 里使用的名称，值是实际请求尺寸。上面的例子可以这样使用：
 
@@ -259,7 +276,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch prompts.json
 
 ### 5. 单图图生图
 
-图生图默认走 Responses API，不走旧的 Images Edits 路线。
+图生图默认走 OpenAI 标准 Images Edits 路线，也就是 `POST /v1/images/edits`。
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --edit --image "C:\path\input.png" --prompt "把这张图改成 9:16 海报风格" --aspect 9:16
@@ -269,7 +286,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --edit --image "C:\path\
 
 ### 6. 多参考图图生图
 
-如果你想让多张参考图一起参与同一次生成，可以传多个 `--image`。插件会按顺序把它们作为多个 `input_image` 上传到同一个 Responses 请求里，不会先拼图。
+如果你想让多张参考图一起参与同一次生成，可以传多个 `--image`。标准模式下插件会按顺序把它们作为多个 multipart `image` 字段上传到同一个 `/v1/images/edits` 请求里；Responses 模式下会作为多个 `input_image` 放进同一个 `/v1/responses` 请求里。两种模式都不会先拼图。
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --edit --image "C:\path\one.png" --image "C:\path\two.png" --image "C:\path\three.png" --prompt "将这些玩具组合成一个在互相玩耍的场景，保留玩具质感和颜色风格" --aspect 16:9
@@ -347,15 +364,17 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 
 这个插件当前的真实行为是：
 
-- 文生图默认走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
-- 图生图默认也走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
+- 默认 `imageRequestMode` 是 `openai`
+- 文生图默认走 `POST https://api.openai.com/v1/images/generations`，可通过参数或配置文件覆盖
+- 图生图默认走 `POST https://api.openai.com/v1/images/edits` multipart，参考图作为 `image` 字段上传
+- 设置 `imageRequestMode: "openai-responses"` 后，文生图和图生图都会走 `POST https://api.openai.com/v1/responses`
 - Responses 请求优先走 `background:true` + 轮询；中转不支持时回退 SSE 流式，再回退普通 JSON 请求
-- 每次 Responses 请求都会在输出目录记录 `*_trace.json` 和 `*.raw.txt`，用于保留 response id / raw response
-- Responses 顶层 `model` 默认不发送；只有 `textModel` 是非空字符串时才发送
-- `imageModelAsTopLevel: true` 时改为 Infinite-Canvas RS 兼容模式：顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
-- 图片工具模型默认是 `gpt-image-2`
-- 图生图使用 `input_text + input_image` 的 Responses 方式
-- 多参考图图生图是多图上传，不是拼图，不走旧版 multipart Images API
+- 每次 API 请求都会在输出目录记录 `*_trace.json` 和 `*.raw.txt`，用于保留 raw response；Responses 模式还会记录 response id
+- Responses 顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
+- 图片模型默认是 `gpt-image-2`
+- 图片 API 质量默认是 `imageQuality: "auto"`；需要强制质量时可设为 `low`、`medium` 或 `high`
+- 多参考图图生图是多图上传，不是拼图
+- 保存图片时兼容 `b64_json` / `base64` / `image_generation_call.result` / 常见 URL 字段 / 嵌套 `result.images` / Responses `output_text` 图片链接；如果一个候选 URL 下载失败，会继续尝试同一响应里的下一个图片候选
 - 支持直接传 `--size`，格式可用 `2048x1024`、`2048X1024`、`2048*1024` 或 `2048×1024`
 - 默认按已验证的 2K 比例矩阵请求；支持 `--quality 1K`，额外尺寸通过配置文件 `sizes` 自定义
 
@@ -429,9 +448,9 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 - 图片路径存在且可读取
 - 图片格式正常
 - 你使用的是 `--edit`
-- 你没有尝试走旧版 Images Edits 路线
+- 默认标准模式下不需要配置 `responsesUrl`
 
-这个插件已经把图生图链路固定在 Responses API 上，不建议再切回旧版编辑接口。
+如果你的中转和 Infinite-Canvas 一样需要 OpenAI RS，请把配置里的 `imageRequestMode` 改成 `openai-responses`。
 
 ## 仓库与插件信息
 
