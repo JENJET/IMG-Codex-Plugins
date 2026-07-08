@@ -117,20 +117,20 @@ Image tool model: gpt-image-2
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-root "https://example.com" --image-model "gpt-image-2"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --text-model "<TEXT_MODEL>"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-profile backup
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-profile manxiaobai
 ```
 
 如果要持久保存到配置文件，可以使用：
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-root "https://example.com" --image-model "gpt-image-2"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile backup --api-root "https://backup.example.com" --image-model "gpt-image-2"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --api-profile backup --set-key "<备用API_KEY>"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-default-api backup
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai --api-root "https://api.manxiaobai.online" --image-model "gpt-image-2" --image-model-as-top-level
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --api-profile manxiaobai --set-key "<MANXIAOBAI_API_KEY>"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-default-api manxiaobai
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 ```
 
-`textModel` 可以省略，也可以设为空字符串；这两种情况下请求体不会发送 Responses 顶层 `model` 字段。只有 `textModel` 是非空字符串时才会作为顶层 `model` 发送。
+`textModel` 可以省略，也可以设为空字符串；这两种情况下默认不会发送 Responses 顶层 `model` 字段。只有 `textModel` 是非空字符串且没有启用 `imageModelAsTopLevel` 时，才会作为顶层 `model` 发送。启用 `imageModelAsTopLevel` 时，顶层 `model` 改用 `imageModel`。
 
 也可以直接编辑配置文件。推荐使用 `defaultApi` + `apis` 配置多个 API 档位，`defaultApi` 指定默认使用哪一个：
 
@@ -141,13 +141,19 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
     "openai": {
       "apiKey": "你的OPENAI_API_KEY",
       "apiRoot": "https://api.openai.com",
-      "responsesUrl": "https://api.openai.com/v1/responses",
       "imageModel": "gpt-image-2"
     },
-    "backup": {
-      "apiKey": "你的备用API_KEY",
-      "apiRoot": "https://backup.example.com",
-      "imageModel": "gpt-image-2"
+    "manxiaobai": {
+      "apiKey": "你的MANXIAOBAI_API_KEY",
+      "apiRoot": "https://api.manxiaobai.online",
+      "imageModel": "gpt-image-2",
+      "imageModelAsTopLevel": true
+    },
+    "mikotopro": {
+      "apiKey": "你的MIKOTO_API_KEY",
+      "apiRoot": "https://api.mikoto.vip",
+      "imageModel": "gpt-image-2",
+      "imageModelAsTopLevel": true
     }
   },
   "sizes": {
@@ -156,13 +162,14 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
       "1024x1824": "1024x1824"
     },
     "2K": {
+      "2048x1024": "2048x1024",
       "wide-card": "2048x1024"
     }
   }
 }
 ```
 
-`responsesUrl` 的优先级高于 `apiRoot`；如果只配置 `apiRoot`，脚本会自动拼接 `/v1/responses`。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
+示例里不要写真实 API Key。`responsesUrl` 可以不配；如果只配置 `apiRoot`，脚本会自动拼接 `/v1/responses`，如果 `apiRoot` 已经以 `/v1` 结尾则只补 `/responses`。Infinite-Canvas 风格的 OpenAI RS 中转建议设置 `imageModelAsTopLevel: true`，此时顶层 `model` 使用 `imageModel`，`textModel` 不参与图片请求。`responsesUrl` 的优先级高于 `apiRoot`，只在中转路径不是 `/v1/responses` 时才需要手动覆盖。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
 
 `sizes` 可以扩展可用尺寸，第一层是质量档位，第二层是你想在 `--aspect` / `--ratio` 里使用的名称，值是实际请求尺寸。上面的例子可以这样使用：
 
@@ -199,6 +206,12 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河�
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --aspect 16:9
+```
+
+直接指定尺寸：
+
+```powershell
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --size 2048*1024
 ```
 
 ### 2. 同提示词多张
@@ -296,7 +309,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 - `landscape = 4:3`
 - `portrait = 3:4`
 
-默认使用 2K 预设矩阵；也可以使用 `--quality 1K` 请求 1K 预设。需要自定义尺寸时，先写入配置文件 `sizes`，再通过 `--aspect` / `--ratio` 使用对应名称。
+默认使用 2K 预设矩阵；也可以使用 `--quality 1K` 请求 1K 预设。需要自定义尺寸时，可以直接传 `--size 2048x1024`，也可以先写入配置文件 `sizes`，再通过 `--aspect` / `--ratio` 使用对应名称。
 
 | 质量 | 比例 | 对应尺寸 |
 | --- | --- | --- |
@@ -336,11 +349,13 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 
 - 文生图默认走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
 - 图生图默认也走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
+- Responses 请求优先走 `background:true` + 轮询；中转不支持时回退 SSE 流式，再回退普通 JSON 请求
 - Responses 顶层 `model` 默认不发送；只有 `textModel` 是非空字符串时才发送
+- `imageModelAsTopLevel: true` 时改为 Infinite-Canvas RS 兼容模式：顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
 - 图片工具模型默认是 `gpt-image-2`
 - 图生图使用 `input_text + input_image` 的 Responses 方式
 - 多参考图图生图是多图上传，不是拼图，不走旧版 multipart Images API
-- 不直接开放 `--size`，自定义尺寸请写入配置文件 `sizes`，然后通过 `--ratio` / `--aspect` 使用
+- 支持直接传 `--size`，格式可用 `2048x1024`、`2048X1024`、`2048*1024` 或 `2048×1024`
 - 默认按已验证的 2K 比例矩阵请求；支持 `--quality 1K`，额外尺寸通过配置文件 `sizes` 自定义
 
 插件内同时保留下面这条提示，供你了解当前上游限制说明：

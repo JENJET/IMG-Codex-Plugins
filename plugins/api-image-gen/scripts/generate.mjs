@@ -22,6 +22,10 @@ const MAX_EDIT_SOURCES = 10;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 180_000;
+const RESPONSES_REJECT_STATUSES = new Set([400, 404, 405, 415, 422]);
+const RESPONSES_POLL_INTERVAL_MS = 5_000;
+const RESPONSES_POLL_TIMEOUT_MS = 1_500_000;
+const RESPONSES_POLL_MAX_TRANSIENT_FAILURES = 5;
 const SUPPORTED_RATIOS = [
   "1:1",
   "3:2",
@@ -142,12 +146,26 @@ function normalizeConfigString(value) {
   return normalized || null;
 }
 
+function normalizeConfigBoolean(value) {
+  if (value === true || value === false) return value;
+  if (value == null) return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  return null;
+}
+
 function stripTrailingSlashes(value) {
   return String(value || "").trim().replace(/\/+$/, "");
 }
 
 function defaultResponsesUrl(apiRoot) {
-  return `${stripTrailingSlashes(apiRoot || DEFAULT_API_CONFIG.apiRoot)}${DEFAULT_API_CONFIG.responsesPath}`;
+  const base = stripTrailingSlashes(apiRoot || DEFAULT_API_CONFIG.apiRoot);
+  const path = DEFAULT_API_CONFIG.responsesPath;
+  for (const prefix of ["/api/v3", "/v1beta", "/v1", "/v2"]) {
+    if (base.endsWith(prefix) && path.startsWith(`${prefix}/`)) return `${base}${path.slice(prefix.length)}`;
+  }
+  return `${base}${path}`;
 }
 
 function resolveConfigPath(flags = {}) {
@@ -195,6 +213,11 @@ function resolveApiConfig(flags = {}, config = {}) {
     || normalizeConfigString(selected.textModel)
     || normalizeConfigString(stored.textModel)
     || normalizeConfigString(config?.textModel);
+  const imageModelAsTopLevel = normalizeConfigBoolean(flags.imageModelAsTopLevel)
+    ?? normalizeConfigBoolean(selected.imageModelAsTopLevel)
+    ?? normalizeConfigBoolean(stored.imageModelAsTopLevel)
+    ?? normalizeConfigBoolean(config?.imageModelAsTopLevel)
+    ?? false;
   return {
     profile: resolveApiProfileSelection(flags, config).name,
     apiRoot,
@@ -204,6 +227,7 @@ function resolveApiConfig(flags = {}, config = {}) {
       || normalizeConfigString(config?.responsesUrl)
       || defaultResponsesUrl(apiRoot),
     ...(textModel ? { textModel } : {}),
+    imageModelAsTopLevel,
     imageModel: normalizeConfigString(flags.imageModel)
       || normalizeConfigString(selected.imageModel)
       || normalizeConfigString(stored.imageModel)
@@ -220,7 +244,7 @@ function resolveApiKey(flags = {}, config = {}) {
 }
 
 function hasApiConfigFlag(flags = {}) {
-  return ["apiRoot", "responsesUrl", "textModel", "imageModel"].some((key) => flags[key] != null);
+  return ["apiRoot", "responsesUrl", "textModel", "imageModel", "imageModelAsTopLevel"].some((key) => flags[key] != null);
 }
 
 function applyApiConfigFlags(config, flags = {}) {
@@ -237,8 +261,9 @@ function applyApiConfigFlags(config, flags = {}) {
   if (flags.responsesUrl != null) next.responsesUrl = normalizeConfigString(flags.responsesUrl);
   if (flags.textModel != null) next.textModel = normalizeConfigString(flags.textModel);
   if (flags.imageModel != null) next.imageModel = normalizeConfigString(flags.imageModel);
+  if (flags.imageModelAsTopLevel != null) next.imageModelAsTopLevel = !!flags.imageModelAsTopLevel;
   for (const [key, value] of Object.entries(next)) {
-    if (!value) delete next[key];
+    if (value == null || value === "") delete next[key];
   }
   if (profileName) {
     if (!config.apis || typeof config.apis !== "object" || Array.isArray(config.apis)) config.apis = {};
@@ -274,6 +299,7 @@ function summarizeApiProfiles(config = {}) {
         apiRoot: profileConfig.apiRoot,
         responsesUrl: profileConfig.responsesUrl,
         ...(profileConfig.textModel ? { textModel: profileConfig.textModel } : {}),
+        imageModelAsTopLevel: profileConfig.imageModelAsTopLevel,
         imageModel: profileConfig.imageModel,
       },
     }];
@@ -490,9 +516,8 @@ function normalizeBase64Image(value) {
   return comma >= 0 ? value.slice(comma + 1) : value;
 }
 
-async function parseErrorResponse(res) {
-  const body = await res.text().catch(() => "");
-  if (!body) return `HTTP ${res.status}`;
+function formatErrorResponse(status, body) {
+  if (!body) return `HTTP ${status}`;
   let parsed = null;
   try {
     parsed = JSON.parse(body);
@@ -502,17 +527,17 @@ async function parseErrorResponse(res) {
   if (parsed?.cloudflare_error || parsed?.error_code || parsed?.error_name) {
     const title = parsed.title || parsed.error_name || "Cloudflare error";
     const retryAfter = parsed.retry_after ? ` retry_after=${parsed.retry_after}s` : "";
-    return `HTTP ${res.status}: ${title}${retryAfter}`;
+    return `HTTP ${status}: ${title}${retryAfter}`;
   }
   const lower = body.toLowerCase();
-  if (lower.includes("bad gateway") || lower.includes("error code 502")) return `HTTP ${res.status}: Cloudflare Bad Gateway`;
-  if (lower.includes("gateway time-out") || lower.includes("error code 504")) return `HTTP ${res.status}: Cloudflare Gateway Timeout`;
-  if (lower.includes("a timeout occurred") || lower.includes("error code 524")) return `HTTP ${res.status}: Cloudflare Timeout`;
+  if (lower.includes("bad gateway") || lower.includes("error code 502")) return `HTTP ${status}: Cloudflare Bad Gateway`;
+  if (lower.includes("gateway time-out") || lower.includes("error code 504")) return `HTTP ${status}: Cloudflare Gateway Timeout`;
+  if (lower.includes("a timeout occurred") || lower.includes("error code 524")) return `HTTP ${status}: Cloudflare Timeout`;
   if (parsed) {
     const message = parsed?.error?.message || parsed?.message || body;
-    return `HTTP ${res.status}: ${message}`;
+    return `HTTP ${status}: ${message}`;
   }
-  return `HTTP ${res.status}: ${body}`;
+  return `HTTP ${status}: ${body}`;
 }
 
 async function requestWithTimeout(url, init, timeoutMs) {
@@ -523,6 +548,18 @@ async function requestWithTimeout(url, init, timeoutMs) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function responsesHeaders(apiKey, accept = "application/json") {
+  return {
+    "Content-Type": "application/json",
+    Accept: accept,
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+function responseTextError(error, timeoutMs = REQUEST_TIMEOUT_MS) {
+  return error?.name === "AbortError" ? `Timeout (${timeoutMs / 1000}s)` : error?.message || String(error);
 }
 
 function sleep(ms) {
@@ -653,6 +690,7 @@ function walkForImageGenerationCall(value) {
 
 function extractImagesFromResponses(raw) {
   const images = [];
+  const partialImages = [];
   for (const line of String(raw || "").split(/\r?\n/)) {
     const event = parseSSEEventLine(line);
     if (!event) continue;
@@ -660,15 +698,22 @@ function extractImagesFromResponses(raw) {
       images.push(event.item.result);
       continue;
     }
+    if (String(event?.type || "").endsWith("partial_image") && typeof event?.partial_image_b64 === "string" && event.partial_image_b64) {
+      partialImages.push(event.partial_image_b64);
+      continue;
+    }
     const found = walkForImageGenerationCall(event);
     if (found?.result) images.push(found.result);
   }
 
   if (images.length > 0) return images;
+  if (partialImages.length > 0) return [partialImages[partialImages.length - 1]];
   try {
     const parsed = JSON.parse(raw);
     const found = walkForImageGenerationCall(parsed);
     if (found?.result) return [found.result];
+    const imageData = extractImagesFromResponse(parsed);
+    if (imageData.length > 0) return imageData;
   } catch {
     // The normal Responses path is SSE, so raw JSON is only a fallback.
   }
@@ -676,7 +721,7 @@ function extractImagesFromResponses(raw) {
 }
 
 function parseSizeForAspect(size) {
-  const match = /^(\d+)x(\d+)$/i.exec(String(size || "").trim());
+  const match = /^(\d+)\s*(?:x|X|\*|×)\s*(\d+)$/.exec(String(size || "").trim());
   if (!match) return null;
   const width = Number(match[1]);
   const height = Number(match[2]);
@@ -855,28 +900,29 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
   for (const dataURL of sourceDataURLs) {
     if (dataURL) content.push({ type: "input_image", image_url: dataURL });
   }
+  const tool = {
+    type: "image_generation",
+    action,
+    size,
+    quality: "auto",
+    output_format: "png",
+    moderation: "low",
+    partial_images: parseSizeForAspect(size) ? 0 : 1,
+  };
+  if (!apiConfig.imageModelAsTopLevel) tool.model = apiConfig.imageModel;
   const body = {
     input: [{
       role: "user",
       content,
     }],
-    tools: [{
-      type: "image_generation",
-      model: apiConfig.imageModel,
-      action,
-      size,
-      quality: "auto",
-      output_format: "png",
-      moderation: "low",
-      partial_images: parseSizeForAspect(size) ? 0 : 1,
-    }],
+    tools: [tool],
     tool_choice: { type: "image_generation" },
     reasoning: { effort: "xhigh" },
     store: false,
-    stream: true,
     instructions: [NO_PROMPT_REVISION_INSTRUCTIONS, aspectInstruction].filter(Boolean).join(" "),
   };
-  if (apiConfig.textModel) body.model = apiConfig.textModel;
+  if (apiConfig.imageModelAsTopLevel) body.model = apiConfig.imageModel;
+  else if (apiConfig.textModel) body.model = apiConfig.textModel;
   return body;
 }
 
@@ -888,33 +934,180 @@ function buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig = resolv
   return buildResponsesImageBody(prompt, size, "edit", sourceDataURLs, apiConfig);
 }
 
+function cloneResponsesBody(body) {
+  const next = { ...(body || {}) };
+  delete next.background;
+  delete next.stream;
+  return next;
+}
+
+function parseJsonText(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function responseStatus(data) {
+  return String(data?.status || "").toLowerCase();
+}
+
+function responseId(data) {
+  return String(data?.id || "").trim();
+}
+
+function isResponsesProcessingStatus(status) {
+  return ["queued", "in_progress", "processing", "pending", "running"].includes(status);
+}
+
+function isResponsesFailedStatus(status) {
+  return ["failed", "cancelled", "canceled", "incomplete"].includes(status);
+}
+
+function responsesFailureMessage(data, prefix) {
+  const message = data?.error?.message
+    || data?.last_error?.message
+    || data?.incomplete_details?.reason
+    || data?.message
+    || JSON.stringify(data || {}).slice(0, 500);
+  return `${prefix}: ${message || "unknown error"}`;
+}
+
+async function pollOpenAIResponse(apiKey, responsesUrl, id) {
+  const retrieveUrl = `${responsesUrl.replace(/\/+$/, "")}/${encodeURIComponent(id)}`;
+  const deadline = Date.now() + RESPONSES_POLL_TIMEOUT_MS;
+  let transientFailures = 0;
+
+  while (Date.now() < deadline) {
+    await sleep(RESPONSES_POLL_INTERVAL_MS);
+    let res;
+    try {
+      res = await requestWithTimeout(retrieveUrl, {
+        method: "GET",
+        headers: responsesHeaders(apiKey),
+      }, REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      transientFailures += 1;
+      if (transientFailures > RESPONSES_POLL_MAX_TRANSIENT_FAILURES) {
+        return { ok: false, error: `Responses background poll failed: ${responseTextError(error)} (id=${id})` };
+      }
+      continue;
+    }
+
+    const raw = await res.text().catch(() => "");
+    if (!res.ok) {
+      transientFailures += 1;
+      if (transientFailures > RESPONSES_POLL_MAX_TRANSIENT_FAILURES) {
+        return { ok: false, error: `${formatErrorResponse(res.status, raw)} (id=${id})` };
+      }
+      continue;
+    }
+
+    transientFailures = 0;
+    const data = parseJsonText(raw);
+    const status = responseStatus(data);
+    if (status === "completed") return { ok: true, raw, route: "background" };
+    if (isResponsesFailedStatus(status)) return { ok: false, error: responsesFailureMessage(data, `Responses background task ${status}`) };
+  }
+
+  return { ok: false, error: `Responses background task timed out after ${Math.round(RESPONSES_POLL_TIMEOUT_MS / 1000)}s (id=${id})` };
+}
+
+async function postOpenAIResponsesBackground(apiKey, responsesUrl, body) {
+  const backgroundBody = { ...cloneResponsesBody(body), background: true };
+  delete backgroundBody.store;
+  let res;
+  try {
+    res = await requestWithTimeout(responsesUrl, {
+      method: "POST",
+      headers: responsesHeaders(apiKey),
+      body: JSON.stringify(backgroundBody),
+    }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    return { fallback: true, reason: responseTextError(error) };
+  }
+
+  if (RESPONSES_REJECT_STATUSES.has(res.status)) return { fallback: true, reason: `background rejected: HTTP ${res.status}` };
+  const raw = await res.text().catch(() => "");
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw) };
+
+  const data = parseJsonText(raw);
+  const status = responseStatus(data);
+  if (status === "completed") return { ok: true, raw, route: "background" };
+  if (isResponsesFailedStatus(status)) return { ok: false, error: responsesFailureMessage(data, `Responses background task ${status}`) };
+
+  const id = responseId(data);
+  if (id && isResponsesProcessingStatus(status)) return pollOpenAIResponse(apiKey, responsesUrl, id);
+  return { ok: true, raw, route: "background" };
+}
+
+async function postOpenAIResponsesStream(apiKey, responsesUrl, body) {
+  const streamBody = { ...cloneResponsesBody(body), stream: true };
+  let res;
+  try {
+    res = await requestWithTimeout(responsesUrl, {
+      method: "POST",
+      headers: responsesHeaders(apiKey, "text/event-stream, application/json"),
+      body: JSON.stringify(streamBody),
+    }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    return { fallback: true, reason: responseTextError(error) };
+  }
+
+  const raw = await res.text().catch(() => "");
+  if (RESPONSES_REJECT_STATUSES.has(res.status)) return { fallback: true, reason: `stream rejected: HTTP ${res.status}` };
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw) };
+  return { ok: true, raw, route: "stream" };
+}
+
+async function postOpenAIResponsesPlain(apiKey, responsesUrl, body) {
+  const plainBody = cloneResponsesBody(body);
+  let res;
+  try {
+    res = await requestWithTimeout(responsesUrl, {
+      method: "POST",
+      headers: responsesHeaders(apiKey),
+      body: JSON.stringify(plainBody),
+    }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    return { ok: false, error: responseTextError(error) };
+  }
+
+  const raw = await res.text().catch(() => "");
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw) };
+  return { ok: true, raw, route: "plain" };
+}
+
+async function postOpenAIResponses(apiKey, responsesUrl, body) {
+  const background = await postOpenAIResponsesBackground(apiKey, responsesUrl, body);
+  if (!background.fallback) return background;
+
+  const stream = await postOpenAIResponsesStream(apiKey, responsesUrl, body);
+  if (!stream.fallback) return stream;
+
+  return postOpenAIResponsesPlain(apiKey, responsesUrl, body);
+}
+
 async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
   const start = Date.now();
   try {
-    const res = await requestWithTimeout(apiConfig.responsesUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream, application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(buildResponsesGenerationBody(prompt, size, apiConfig)),
-    }, REQUEST_TIMEOUT_MS);
-    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res) };
+    const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesGenerationBody(prompt, size, apiConfig));
+    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error };
 
-    const raw = await res.text();
+    const raw = response.raw;
     const [base64] = extractImagesFromResponses(raw);
     const saved = saveBase64Image(base64, outputDir, "img", null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: "No image_generation_call result in Responses stream" };
+    if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}` };
     return { ok: true, elapsed, ...saved };
   } catch (error) {
     return {
       ok: false,
       elapsed: Date.now() - start,
-      error: error?.name === "AbortError" ? `Timeout (${REQUEST_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      error: responseTextError(error),
     };
   }
 }
@@ -966,28 +1159,20 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
   const sourceDataURLs = sources.map((item) => item.dataURL).filter(Boolean);
   const sourceName = summarizeSources(sources);
   try {
-    const res = await requestWithTimeout(apiConfig.responsesUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream, application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig)),
-    }, REQUEST_TIMEOUT_MS);
-    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res), sourceName };
+    const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig));
+    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, sourceName };
 
-    const raw = await res.text();
+    const raw = response.raw;
     const [base64] = extractImagesFromResponses(raw);
     const saved = saveBase64Image(base64, outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: "No image_generation_call result in Responses stream", sourceName };
+    if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, sourceName };
     return { ok: true, elapsed, ...saved, sourceName };
   } catch (error) {
     return {
       ok: false,
       elapsed: Date.now() - start,
-      error: error?.name === "AbortError" ? `Timeout (${REQUEST_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      error: responseTextError(error),
       sourceName,
     };
   }
@@ -1338,6 +1523,11 @@ async function runEditResponsesSelfTest() {
     },
   ];
   const apiConfig = resolveApiConfig();
+  const explicitSizeOk = normalizeSizeString("2048x1024") === "2048x1024"
+    && normalizeSizeString("2048X1024") === "2048x1024"
+    && normalizeSizeString("2048*1024") === "2048x1024"
+    && normalizeSizeString("2048×1024") === "2048x1024"
+    && resolveGenerationParams({ size: "2048*1024" }, null).size === "2048x1024";
   const payload = buildResponsesEditBody("mock edit prompt", "1152x2048", sources.map((item) => item.dataURL), apiConfig);
   const explicitModelPayload = buildResponsesEditBody(
     "mock edit prompt",
@@ -1345,14 +1535,28 @@ async function runEditResponsesSelfTest() {
     sources.map((item) => item.dataURL),
     { ...apiConfig, textModel: "mock-text-model" },
   );
+  const topLevelImagePayload = buildResponsesEditBody(
+    "mock edit prompt",
+    "1152x2048",
+    sources.map((item) => item.dataURL),
+    { ...apiConfig, imageModelAsTopLevel: true },
+  );
   const content = payload.input?.[0]?.content || [];
   const tool = payload.tools?.[0] || {};
-  const modelOk = apiConfig.textModel
-    ? payload.model === apiConfig.textModel
-    : !Object.prototype.hasOwnProperty.call(payload, "model");
+  const modelOk = apiConfig.imageModelAsTopLevel
+    ? payload.model === apiConfig.imageModel && !Object.prototype.hasOwnProperty.call(tool, "model")
+    : tool.model === apiConfig.imageModel
+      && (apiConfig.textModel
+        ? payload.model === apiConfig.textModel
+        : !Object.prototype.hasOwnProperty.call(payload, "model"));
+  const topLevelImageOk = topLevelImagePayload.model === apiConfig.imageModel
+    && !Object.prototype.hasOwnProperty.call(topLevelImagePayload.tools?.[0] || {}, "model");
+  const cloneOk = !Object.prototype.hasOwnProperty.call(cloneResponsesBody({ ...payload, stream: true, background: true }), "stream")
+    && !Object.prototype.hasOwnProperty.call(cloneResponsesBody({ ...payload, stream: true, background: true }), "background");
   const payloadOk = modelOk
-    && explicitModelPayload.model === "mock-text-model"
-    && payload.stream === true
+    && topLevelImageOk
+    && explicitModelPayload.model === (apiConfig.imageModelAsTopLevel ? apiConfig.imageModel : "mock-text-model")
+    && !Object.prototype.hasOwnProperty.call(payload, "stream")
     && payload.store === false
     && content[0]?.type === "input_text"
     && content[1]?.type === "input_image"
@@ -1360,7 +1564,6 @@ async function runEditResponsesSelfTest() {
     && content[2]?.type === "input_image"
     && content[2]?.image_url === sources[1].dataURL
     && tool.type === "image_generation"
-    && tool.model === apiConfig.imageModel
     && tool.action === "edit"
     && tool.size === "1152x2048"
     && tool.output_format === "png"
@@ -1370,9 +1573,48 @@ async function runEditResponsesSelfTest() {
   const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
   const raw = `data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"${pngB64}"}}\n`;
   const [base64] = extractImagesFromResponses(raw);
+  const [jsonBase64] = extractImagesFromResponses(JSON.stringify({
+    status: "completed",
+    output: [{ type: "image_generation_call", result: pngB64 }],
+  }));
+  const [partialBase64] = extractImagesFromResponses(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"${pngB64}"}\n`);
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  let fallbackOk = false;
+  try {
+    globalThis.fetch = async (_url, init = {}) => {
+      const parsedBody = init.body ? JSON.parse(init.body) : null;
+      fetchCalls.push({ method: init.method, body: parsedBody });
+      if (fetchCalls.length === 1) {
+        return new Response(JSON.stringify({ error: { message: "background unsupported" } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(raw, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    const fallbackResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+    fallbackOk = fallbackResult.ok
+      && fallbackResult.route === "stream"
+      && fetchCalls.length === 2
+      && fetchCalls[0].body?.background === true
+      && !Object.prototype.hasOwnProperty.call(fetchCalls[0].body, "stream")
+      && !Object.prototype.hasOwnProperty.call(fetchCalls[0].body, "store")
+      && fetchCalls[1].body?.stream === true;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
   const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
   const saved = saveBase64Image(base64, outputDir, "self_test_edit");
-  const savedOk = !!saved?.path && existsSync(saved.path) && saved.width === 1 && saved.height === 1;
+  const savedOk = !!saved?.path
+    && existsSync(saved.path)
+    && saved.width === 1
+    && saved.height === 1
+    && jsonBase64 === pngB64
+    && partialBase64 === pngB64;
   const resizedSaved = saveBase64Image(base64, outputDir, "self_test_resize", null, "2x2");
   const resizePreserveOk = process.platform === "win32"
     ? !!resizedSaved?.path
@@ -1390,10 +1632,14 @@ async function runEditResponsesSelfTest() {
       && resizedSaved.height === 1
       && !!resizedSaved.resizeError;
 
-  if (!payloadOk || !savedOk || !resizePreserveOk) {
+  if (!explicitSizeOk || !payloadOk || !cloneOk || !fallbackOk || !savedOk || !resizePreserveOk) {
     console.error("Edit Responses self-test FAILED.");
     console.error(JSON.stringify({
+      explicitSizeOk,
       payloadOk,
+      cloneOk,
+      fallbackOk,
+      fetchCalls,
       savedOk,
       resizePreserveOk,
       saved,
@@ -1422,6 +1668,8 @@ function parseArgs(argv) {
     else if (value === "--responses-url" && argv[i + 1]) args.flags.responsesUrl = argv[++i];
     else if (value === "--text-model" && i + 1 < argv.length) args.flags.textModel = argv[++i];
     else if (value === "--image-model" && argv[i + 1]) args.flags.imageModel = argv[++i];
+    else if (value === "--image-model-as-top-level") args.flags.imageModelAsTopLevel = true;
+    else if (value === "--no-image-model-as-top-level") args.flags.imageModelAsTopLevel = false;
     else if (value === "--set-quick-mode") args.flags.setQuickMode = true;
     else if (value === "--set-batch-mode") args.flags.setBatchMode = true;
     else if (value === "--prompt" && argv[i + 1]) args.prompts.push(argv[++i]);
@@ -1475,24 +1723,25 @@ CONFIG
   --api-profile NAME
   --set-key <key>
   --set-default-api NAME
-  --set-api-config [--api-profile NAME] [--api-root URL] [--responses-url URL] [--text-model MODEL] [--image-model MODEL]
+  --set-api-config [--api-profile NAME] [--api-root URL] [--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--image-model-as-top-level|--no-image-model-as-top-level]
   --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--api-profile NAME] [--api-root URL|--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--ratio R|--aspect R] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--api-profile NAME] [--api-root URL|--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--image-model-as-top-level] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
-  --batch prompts.json [--ratio R|--aspect R] [--concurrency N] [--no-resize]
-  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--no-resize]
+  --batch prompts.json [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
+  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
-  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one Responses edit request
-  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--concurrency N] [--no-resize]
+  --edit --image path.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
+  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one Responses edit request
+  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
   image-to-image route is fixed to Responses API; --legacy-edit and --edit-api images are disabled
 
 TOOLS
   --resolve-size --quality 2K --aspect 16:9
+  --resolve-size --size 2048*1024
   --self-test-adaptive
   --self-test-edit-responses
 
@@ -1502,6 +1751,7 @@ DEFAULTS
   responses URL: ${defaultResponsesUrl(DEFAULT_API_CONFIG.apiRoot)}
   text model: not sent unless textModel is configured
   image model: ${DEFAULT_API_CONFIG.imageModel}
+  image model as top-level: off
   edit API: responses only
   request quality: default ${DEFAULTS.quality}; supported ${Object.keys(sizeMatrix).join(", ")}
   output: ~/Pictures/api-image-gen
@@ -1517,7 +1767,7 @@ SIZE MATRIX
   1K: 1:1 1024x1024, 3:2 1536x1024, 2:3 1024x1536, 4:3 1536x1152, 3:4 1152x1536, 16:9 1536x864, 9:16 864x1536, 2:1 1536x768, 1:2 768x1536, 7:4 1664x944, 4:7 944x1664
   2K: 1:1 2048x2048, 3:2 2048x1360, 2:3 1360x2048, 4:3 2048x1536, 3:4 1536x2048, 16:9 2048x1152, 9:16 1152x2048, 2:1 2048x1024, 1:2 1024x2048, 7:4 2208x1264, 4:7 1264x2208
   custom sizes: add config.sizes. Example: { "1K": { "poster": "1024x1824" } }
-  --size WxH is disabled. Use only --ratio/--aspect from the fixed supported list above.`);
+  explicit size: --size 2048x1024, --size 2048X1024, --size 2048*1024, or --size 2048×1024`);
 }
 
 function resolveGenerationParams(flags, modeConfig, sizeMatrix = resolveSizeMatrix()) {
@@ -1528,8 +1778,12 @@ function resolveGenerationParams(flags, modeConfig, sizeMatrix = resolveSizeMatr
   }
 
   if (flags.size) {
-    console.error(`ERROR: --size is disabled in this plugin. Use only --aspect/--ratio. Supported ratios: ${supportedRatioText(null, sizeMatrix)}. Disabled ratios: 5:4, 4:5, 3:1, 1:3.`);
-    process.exit(1);
+    const size = normalizeSizeString(flags.size);
+    if (!size) {
+      console.error(`ERROR: Invalid size="${flags.size}". Use WIDTHxHEIGHT, WIDTHXHEIGHT, WIDTH*HEIGHT, or WIDTH×HEIGHT, for example 2048x1024.`);
+      process.exit(1);
+    }
+    return { quality, ratio: aspectRatioForSize(size), size, explicitSize: true, requestedSize: flags.size };
   }
 
   const requestedRatio = flags.aspect ?? flags.ratio ?? modeConfig?.ratio ?? DEFAULTS.ratio;
@@ -1593,7 +1847,7 @@ async function main() {
 
   if (flags.setApiConfig) {
     if (!hasApiConfigFlag(flags)) {
-      console.error("ERROR: --set-api-config requires at least one of --api-root, --responses-url, --text-model, or --image-model.");
+      console.error("ERROR: --set-api-config requires at least one of --api-root, --responses-url, --text-model, --image-model, --image-model-as-top-level, or --no-image-model-as-top-level.");
       process.exit(1);
     }
     applyApiConfigFlags(config, flags);

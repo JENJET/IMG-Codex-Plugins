@@ -49,7 +49,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --api-profile "<PROFILE_
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-default-api "<PROFILE_NAME>"
 ```
 
-The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `responsesUrl`, optional `textModel`, and `imageModel`. `textModel` may be omitted or set to an empty string; in both cases, the Responses request body does not send a top-level `model` field. A non-empty `textModel` is sent as the top-level `model`. `responsesUrl` overrides `apiRoot`; when only `apiRoot` is configured, the script appends `/v1/responses`. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
+The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `responsesUrl`, optional `textModel`, `imageModel`, and `imageModelAsTopLevel`. `textModel` may be omitted or set to an empty string; in both cases, the Responses request body does not send a top-level `model` field unless `imageModelAsTopLevel` is true. A non-empty `textModel` is sent as the top-level `model` only when `imageModelAsTopLevel` is not true. `imageModelAsTopLevel:true` matches Infinite-Canvas OpenAI RS mode: top-level `model` is `imageModel` and the image_generation tool omits its own `model`. `responsesUrl` overrides `apiRoot`; when only `apiRoot` is configured, the script appends `/v1/responses`, or only `/responses` if `apiRoot` already ends with `/v1`. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
 
 ```json
 {
@@ -58,13 +58,19 @@ The config file can contain multiple API profiles under `apis` and choose the de
     "openai": {
       "apiKey": "<USER_KEY>",
       "apiRoot": "https://api.openai.com",
-      "responsesUrl": "https://api.openai.com/v1/responses",
       "imageModel": "gpt-image-2"
     },
-    "backup": {
-      "apiKey": "<BACKUP_KEY>",
-      "apiRoot": "https://backup.example.com",
-      "imageModel": "gpt-image-2"
+    "manxiaobai": {
+      "apiKey": "<MANXIAOBAI_KEY>",
+      "apiRoot": "https://api.manxiaobai.online",
+      "imageModel": "gpt-image-2",
+      "imageModelAsTopLevel": true
+    },
+    "mikotopro": {
+      "apiKey": "<MIKOTO_KEY>",
+      "apiRoot": "https://api.mikoto.vip",
+      "imageModel": "gpt-image-2",
+      "imageModelAsTopLevel": true
     }
   }
 }
@@ -99,7 +105,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>"
 
 Generation requests default to the 2K preset matrix. `--quality 1K` is supported for the same enabled aspect list. Do not offer 4K choices. If the user asks for another exact pixel size, add it to config `sizes` first or map the request to the nearest supported fixed aspect preset and tell them: `由于上游请求限制只能接收1K图像，详细计费以后台为准。`
 
-Pass only `--ratio`/`--aspect` when the user asks for a shape. Do not use `--size` for normal generation or edit requests. For custom dimensions, add them to config `sizes` first, then pass the configured label through `--aspect` or `--ratio`.
+Pass `--ratio`/`--aspect` when the user asks for a shape, or pass `--size` for explicit dimensions. `--size` accepts `WIDTHxHEIGHT`, `WIDTHXHEIGHT`, `WIDTH*HEIGHT`, and `WIDTH×HEIGHT`, for example `2048x1024` or `2048*1024`. Config `sizes` labels remain supported through `--aspect` or `--ratio`.
 
 ```bash
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --aspect 16:9
@@ -107,7 +113,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --as
 
 Supported default 2K aspects are fixed to `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `16:9`, `9:16`, `2:1`, `1:2`, `7:4`, and `4:7`. `--quality 1K` supports those same enabled aspects. Aliases are `square=1:1`, `landscape=4:3`, and `portrait=3:4`.
 
-The ratios `5:4`, `4:5`, `3:1`, and `1:3` are disabled in this plugin because repeated upstream tests returned `502` for them. Do not request them, and do not re-enable them unless new real tests prove they are stable.
+The preset `--ratio` / `--aspect` values `5:4`, `4:5`, `3:1`, and `1:3` are disabled in this plugin because repeated upstream tests returned `502` for them. Do not re-enable those preset ratio labels unless new real tests prove they are stable. Explicit `--size WIDTHxHEIGHT` remains allowed.
 
 Upstream may return a near-aspect image with non-exact pixels. On Windows, the script keeps the original upstream PNG, writes a center-cropped/resized copy beside it with a `_resized` suffix, and reports `resized from <original>` plus the original path. Resize is enabled by default for text-to-image, batch, and edit; pass `--no-resize` to keep the true upstream raster as the final output, or `--resize` to enable it explicitly.
 
@@ -140,11 +146,11 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-batch-mode --ratio
 The image-to-image route is fixed to Responses API in this plugin. Endpoint and model values below are defaults and may be overridden by CLI flags or config:
 
 - Endpoint: `POST https://api.openai.com/v1/responses`
-- Responses top-level `model`: omitted unless `textModel` is a non-empty string
+- Responses top-level `model`: omitted unless `textModel` is a non-empty string, or `imageModelAsTopLevel:true` sends `imageModel` as the top-level model
 - Image tool: `gpt-image-2`
 - Tool action: `edit`
 - Input method: first one `input_text`, then one `input_image` block per source image, in order
-- Output policy: `output_format:"png"`, `moderation:"low"`, `partial_images:0`, `stream:true`
+- Output policy: `output_format:"png"`, `moderation:"low"`, `partial_images:0`; the sender tries `background:true` + poll first, then SSE `stream:true`, then plain JSON fallback
 - This is not a collage step and not legacy multipart edit
 
 Default image-to-image edits use Responses API with `input_image` and the image tool `action:"edit"`:
@@ -177,15 +183,15 @@ Do not use `--legacy-edit` or `--edit-api images` here. They are disabled so the
 
 - Text-to-image: `POST https://api.openai.com/v1/responses`
 - Image edit: `POST https://api.openai.com/v1/responses`
-- Responses top-level `model`: omitted unless `textModel` is a non-empty string
+- Responses top-level `model`: omitted unless `textModel` is a non-empty string, or `imageModelAsTopLevel:true` sends `imageModel` as the top-level model
 - Image generation tool model: `gpt-image-2`
 - The endpoint and model names above are defaults; the script can override them with CLI flags, `--api-profile`, or the local `defaultApi` / `apis` config
-- Request size policy: use the default preset matrix, `--quality 1K`, or a user-defined config `sizes` entry; do not request 4K, disabled ratios, or arbitrary `--size`
+- Request size policy: use the default preset matrix, `--quality 1K`, a user-defined config `sizes` entry, or explicit `--size WIDTHxHEIGHT` / `WIDTH*HEIGHT`
 - Auth: `Authorization: Bearer <API Key>`
-- Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, `store:false`, and `stream:true`
+- Responses body: JSON with optional `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; `imageModelAsTopLevel:true` puts `imageModel` in top-level `model` and omits `tools[0].model`; request mode follows the background -> SSE -> plain JSON fallback chain
 - Edit Responses input: `input_text` plus one `input_image` data URL per source image, in order
 - Edit Responses tool: `type:"image_generation"`, `action:"edit"`, `output_format:"png"`, `moderation:"low"`, `partial_images:0`
-- Responses result parsing: final image comes from SSE event `response.output_item.done` where `item.type` is `image_generation_call` and `item.result` is base64 image data
+- Responses result parsing: final image can come from background/plain JSON `image_generation_call.result`, SSE `response.output_item.done`, or the last partial image event as a fallback
 - Saved PNG dimensions are normalized locally to the requested `size` unless `--no-resize` is used; when resize occurs, `path` points to the `_resized` copy and `originalPath` points to the retained upstream PNG
 
 ## Verification
