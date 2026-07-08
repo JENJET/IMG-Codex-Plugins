@@ -641,6 +641,107 @@ function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = n
   };
 }
 
+function createResponseTrace(outputDir, prefix) {
+  if (!outputDir) return null;
+  const suffix = Math.random().toString(36).slice(2, 6);
+  const baseName = `${prefix || "response"}_${timestamp()}_${suffix}`;
+  return {
+    outputDir,
+    baseName,
+    metadataPath: join(outputDir, `${baseName}_trace.json`),
+    responseIds: [],
+    files: [],
+  };
+}
+
+function traceStageSlug(stage) {
+  return String(stage || "response").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "response";
+}
+
+function addTraceResponseId(trace, id) {
+  const clean = String(id || "").trim();
+  if (!trace || !clean || trace.responseIds.includes(clean)) return;
+  trace.responseIds.push(clean);
+}
+
+function collectResponseIds(value, ids = new Set(), isTopLevel = true) {
+  if (!value || typeof value !== "object") return ids;
+  if (Array.isArray(value)) {
+    for (const child of value) collectResponseIds(child, ids, false);
+    return ids;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if ((key === "id" || key === "response_id") && typeof child === "string") {
+      const clean = child.trim();
+      if (isTopLevel || clean.startsWith("resp_")) ids.add(clean);
+    } else if (child && typeof child === "object") {
+      collectResponseIds(child, ids, false);
+    }
+  }
+  return ids;
+}
+
+function responseIdsFromRaw(raw) {
+  const ids = new Set();
+  for (const line of String(raw || "").split(/\r?\n/)) {
+    const event = parseSSEEventLine(line);
+    if (event) collectResponseIds(event, ids, true);
+  }
+  const parsed = parseJsonText(raw);
+  if (parsed) collectResponseIds(parsed, ids, true);
+  return [...ids];
+}
+
+function writeResponseTraceMetadata(trace) {
+  if (!trace) return;
+  writeFileSync(trace.metadataPath, `${JSON.stringify({
+    responseIds: trace.responseIds,
+    files: trace.files,
+  }, null, 2)}\n`);
+}
+
+function recordRawResponse(trace, stage, raw, meta = {}) {
+  if (!trace || raw == null) return null;
+  const rawText = String(raw);
+  const replaceKey = meta.replaceKey || null;
+  let entry = replaceKey ? trace.files.find((item) => item.replaceKey === replaceKey) : null;
+  if (!entry) {
+    const order = String(trace.files.length + 1).padStart(2, "0");
+    entry = {
+      stage,
+      replaceKey,
+      path: join(trace.outputDir, `${trace.baseName}_${order}_${traceStageSlug(stage)}.raw.txt`),
+    };
+    trace.files.push(entry);
+  }
+  writeFileSync(entry.path, rawText);
+  entry.stage = stage;
+  entry.route = meta.route || null;
+  entry.httpStatus = meta.httpStatus || null;
+  entry.bytes = Buffer.byteLength(rawText);
+  entry.updatedAt = new Date().toISOString();
+  for (const id of responseIdsFromRaw(rawText)) addTraceResponseId(trace, id);
+  writeResponseTraceMetadata(trace);
+  return entry.path;
+}
+
+function responseTraceInfo(trace) {
+  if (!trace) return {};
+  const rawFiles = trace.files.map((item) => item.path).filter(Boolean);
+  return {
+    responseId: trace.responseIds[0] || null,
+    responseTracePath: trace.metadataPath,
+    rawResponsePath: rawFiles[rawFiles.length - 1] || null,
+  };
+}
+
+function formatResponseTrace(result) {
+  if (!result?.responseTracePath) return "";
+  const id = result.responseId ? `id=${result.responseId}, ` : "";
+  const raw = result.rawResponsePath ? `, raw=${result.rawResponsePath}` : "";
+  return `${id}trace=${result.responseTracePath}${raw}`;
+}
+
 function formatImageResult(result) {
   const parts = [result.fileSize].filter(Boolean);
   if (result.dimensions) parts.push(result.dimensions);
@@ -974,10 +1075,11 @@ function responsesFailureMessage(data, prefix) {
   return `${prefix}: ${message || "unknown error"}`;
 }
 
-async function pollOpenAIResponse(apiKey, responsesUrl, id) {
+async function pollOpenAIResponse(apiKey, responsesUrl, id, trace = null) {
   const retrieveUrl = `${responsesUrl.replace(/\/+$/, "")}/${encodeURIComponent(id)}`;
   const deadline = Date.now() + RESPONSES_POLL_TIMEOUT_MS;
   let transientFailures = 0;
+  addTraceResponseId(trace, id);
 
   while (Date.now() < deadline) {
     await sleep(RESPONSES_POLL_INTERVAL_MS);
@@ -996,10 +1098,15 @@ async function pollOpenAIResponse(apiKey, responsesUrl, id) {
     }
 
     const raw = await res.text().catch(() => "");
+    recordRawResponse(trace, "background-poll-latest", raw, {
+      route: "background",
+      httpStatus: res.status,
+      replaceKey: "background-poll-latest",
+    });
     if (!res.ok) {
       transientFailures += 1;
       if (transientFailures > RESPONSES_POLL_MAX_TRANSIENT_FAILURES) {
-        return { ok: false, error: `${formatErrorResponse(res.status, raw)} (id=${id})` };
+        return { ok: false, error: `${formatErrorResponse(res.status, raw)} (id=${id})`, raw, route: "background", responseId: id };
       }
       continue;
     }
@@ -1007,14 +1114,17 @@ async function pollOpenAIResponse(apiKey, responsesUrl, id) {
     transientFailures = 0;
     const data = parseJsonText(raw);
     const status = responseStatus(data);
-    if (status === "completed") return { ok: true, raw, route: "background" };
-    if (isResponsesFailedStatus(status)) return { ok: false, error: responsesFailureMessage(data, `Responses background task ${status}`) };
+    if (status === "completed") {
+      recordRawResponse(trace, "background-completed", raw, { route: "background", httpStatus: res.status });
+      return { ok: true, raw, route: "background", responseId: id };
+    }
+    if (isResponsesFailedStatus(status)) return { ok: false, error: `${responsesFailureMessage(data, `Responses background task ${status}`)} (id=${id})`, raw, route: "background", responseId: id };
   }
 
-  return { ok: false, error: `Responses background task timed out after ${Math.round(RESPONSES_POLL_TIMEOUT_MS / 1000)}s (id=${id})` };
+  return { ok: false, error: `Responses background task timed out after ${Math.round(RESPONSES_POLL_TIMEOUT_MS / 1000)}s (id=${id})`, responseId: id, route: "background" };
 }
 
-async function postOpenAIResponsesBackground(apiKey, responsesUrl, body) {
+async function postOpenAIResponsesBackground(apiKey, responsesUrl, body, trace = null) {
   const backgroundBody = { ...cloneResponsesBody(body), background: true };
   delete backgroundBody.store;
   let res;
@@ -1028,21 +1138,23 @@ async function postOpenAIResponsesBackground(apiKey, responsesUrl, body) {
     return { fallback: true, reason: responseTextError(error) };
   }
 
-  if (RESPONSES_REJECT_STATUSES.has(res.status)) return { fallback: true, reason: `background rejected: HTTP ${res.status}` };
   const raw = await res.text().catch(() => "");
-  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw) };
+  recordRawResponse(trace, "background-create", raw, { route: "background", httpStatus: res.status });
+  if (RESPONSES_REJECT_STATUSES.has(res.status)) return { fallback: true, reason: `background rejected: HTTP ${res.status}` };
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "background", responseId: responseId(parseJsonText(raw)) };
 
   const data = parseJsonText(raw);
   const status = responseStatus(data);
-  if (status === "completed") return { ok: true, raw, route: "background" };
-  if (isResponsesFailedStatus(status)) return { ok: false, error: responsesFailureMessage(data, `Responses background task ${status}`) };
-
   const id = responseId(data);
-  if (id && isResponsesProcessingStatus(status)) return pollOpenAIResponse(apiKey, responsesUrl, id);
-  return { ok: true, raw, route: "background" };
+  addTraceResponseId(trace, id);
+  if (status === "completed") return { ok: true, raw, route: "background", responseId: id };
+  if (isResponsesFailedStatus(status)) return { ok: false, error: responsesFailureMessage(data, `Responses background task ${status}`), raw, route: "background", responseId: id };
+
+  if (id && isResponsesProcessingStatus(status)) return pollOpenAIResponse(apiKey, responsesUrl, id, trace);
+  return { ok: true, raw, route: "background", responseId: id };
 }
 
-async function postOpenAIResponsesStream(apiKey, responsesUrl, body) {
+async function postOpenAIResponsesStream(apiKey, responsesUrl, body, trace = null) {
   const streamBody = { ...cloneResponsesBody(body), stream: true };
   let res;
   try {
@@ -1056,12 +1168,13 @@ async function postOpenAIResponsesStream(apiKey, responsesUrl, body) {
   }
 
   const raw = await res.text().catch(() => "");
+  recordRawResponse(trace, "stream", raw, { route: "stream", httpStatus: res.status });
   if (RESPONSES_REJECT_STATUSES.has(res.status)) return { fallback: true, reason: `stream rejected: HTTP ${res.status}` };
-  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw) };
-  return { ok: true, raw, route: "stream" };
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "stream", responseId: responseIdsFromRaw(raw)[0] || null };
+  return { ok: true, raw, route: "stream", responseId: responseIdsFromRaw(raw)[0] || null };
 }
 
-async function postOpenAIResponsesPlain(apiKey, responsesUrl, body) {
+async function postOpenAIResponsesPlain(apiKey, responsesUrl, body, trace = null) {
   const plainBody = cloneResponsesBody(body);
   let res;
   try {
@@ -1075,39 +1188,43 @@ async function postOpenAIResponsesPlain(apiKey, responsesUrl, body) {
   }
 
   const raw = await res.text().catch(() => "");
-  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw) };
-  return { ok: true, raw, route: "plain" };
+  recordRawResponse(trace, "plain", raw, { route: "plain", httpStatus: res.status });
+  if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "plain", responseId: responseIdsFromRaw(raw)[0] || null };
+  return { ok: true, raw, route: "plain", responseId: responseIdsFromRaw(raw)[0] || null };
 }
 
-async function postOpenAIResponses(apiKey, responsesUrl, body) {
-  const background = await postOpenAIResponsesBackground(apiKey, responsesUrl, body);
+async function postOpenAIResponses(apiKey, responsesUrl, body, trace = null) {
+  const background = await postOpenAIResponsesBackground(apiKey, responsesUrl, body, trace);
   if (!background.fallback) return background;
 
-  const stream = await postOpenAIResponsesStream(apiKey, responsesUrl, body);
+  const stream = await postOpenAIResponsesStream(apiKey, responsesUrl, body, trace);
   if (!stream.fallback) return stream;
 
-  return postOpenAIResponsesPlain(apiKey, responsesUrl, body);
+  return postOpenAIResponsesPlain(apiKey, responsesUrl, body, trace);
 }
 
 async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
+  const trace = createResponseTrace(outputDir, "response_generate");
   const start = Date.now();
   try {
-    const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesGenerationBody(prompt, size, apiConfig));
-    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error };
+    const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesGenerationBody(prompt, size, apiConfig), trace);
+    addTraceResponseId(trace, response.responseId);
+    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, ...responseTraceInfo(trace) };
 
     const raw = response.raw;
     const [base64] = extractImagesFromResponses(raw);
     const saved = saveBase64Image(base64, outputDir, "img", null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}` };
-    return { ok: true, elapsed, ...saved };
+    if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, ...responseTraceInfo(trace) };
+    return { ok: true, elapsed, ...saved, ...responseTraceInfo(trace) };
   } catch (error) {
     return {
       ok: false,
       elapsed: Date.now() - start,
       error: responseTextError(error),
+      ...responseTraceInfo(trace),
     };
   }
 }
@@ -1155,25 +1272,28 @@ function loadSourceImages(imagePaths) {
 async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
+  const trace = createResponseTrace(outputDir, "response_edit");
   const start = Date.now();
   const sourceDataURLs = sources.map((item) => item.dataURL).filter(Boolean);
   const sourceName = summarizeSources(sources);
   try {
-    const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig));
-    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, sourceName };
+    const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig), trace);
+    addTraceResponseId(trace, response.responseId);
+    if (!response.ok) return { ok: false, elapsed: Date.now() - start, error: response.error, sourceName, ...responseTraceInfo(trace) };
 
     const raw = response.raw;
     const [base64] = extractImagesFromResponses(raw);
     const saved = saveBase64Image(base64, outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, sourceName };
-    return { ok: true, elapsed, ...saved, sourceName };
+    if (!saved) return { ok: false, elapsed, error: `No image_generation_call result in Responses ${response.route || "response"}`, sourceName, ...responseTraceInfo(trace) };
+    return { ok: true, elapsed, ...saved, sourceName, ...responseTraceInfo(trace) };
   } catch (error) {
     return {
       ok: false,
       elapsed: Date.now() - start,
       error: responseTextError(error),
       sourceName,
+      ...responseTraceInfo(trace),
     };
   }
 }
@@ -1369,6 +1489,8 @@ async function runBatch(apiKey, prompts, size, concurrency, outputDir, options =
         console.log(`Prompt: "${result.prompt}"`);
         console.log(`FAILED: ${result.error}`);
       }
+      const traceText = formatResponseTrace(result);
+      if (traceText) console.log(`Response trace: ${traceText}`);
       console.log("");
     }
   }
@@ -1383,6 +1505,11 @@ async function runBatch(apiKey, prompts, size, concurrency, outputDir, options =
   if (ok.length > 0) {
     console.log("Successful paths:");
     for (const result of ok) console.log(result.path);
+  }
+  const traced = results.filter((item) => item?.responseTracePath);
+  if (traced.length > 0) {
+    console.log("Response traces:");
+    for (const result of traced) console.log(formatResponseTrace(result));
   }
 
   const report = {
@@ -1429,8 +1556,14 @@ async function runBatchEdit(apiKey, imagePaths, prompt, size, concurrency, outpu
   console.log(`Edit prompt: "${prompt}"`);
   for (const result of ok) {
     console.log(`${basename(result.path)} <- ${result.sourceName} ${formatImageResult(result)}`);
+    const traceText = formatResponseTrace(result);
+    if (traceText) console.log(`Response trace: ${traceText}`);
   }
-  for (const result of failed) console.log(`FAILED ${result.sourceName}: ${result.error}`);
+  for (const result of failed) {
+    console.log(`FAILED ${result.sourceName}: ${result.error}`);
+    const traceText = formatResponseTrace(result);
+    if (traceText) console.log(`Response trace: ${traceText}`);
+  }
   console.log(`Done: ${ok.length}/${total} in ${(elapsed / 1000).toFixed(1)}s`);
   console.log(`Output: ${outputDir}`);
   return failed.length > 0 ? 1 : 0;
@@ -1571,13 +1704,16 @@ async function runEditResponsesSelfTest() {
     && payload.tool_choice?.type === "image_generation";
 
   const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-  const raw = `data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"${pngB64}"}}\n`;
+  const raw = `data: {"type":"response.output_item.done","response":{"id":"resp_mock_trace"},"item":{"type":"image_generation_call","result":"${pngB64}"}}\n`;
   const [base64] = extractImagesFromResponses(raw);
   const [jsonBase64] = extractImagesFromResponses(JSON.stringify({
+    id: "resp_mock_json",
     status: "completed",
     output: [{ type: "image_generation_call", result: pngB64 }],
   }));
   const [partialBase64] = extractImagesFromResponses(`data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"${pngB64}"}\n`);
+  const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
+  const trace = createResponseTrace(outputDir, "self_test_response");
   const originalFetch = globalThis.fetch;
   const fetchCalls = [];
   let fallbackOk = false;
@@ -1596,7 +1732,7 @@ async function runEditResponsesSelfTest() {
         headers: { "content-type": "text/event-stream" },
       });
     };
-    const fallbackResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+    const fallbackResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload, trace);
     fallbackOk = fallbackResult.ok
       && fallbackResult.route === "stream"
       && fetchCalls.length === 2
@@ -1607,7 +1743,10 @@ async function runEditResponsesSelfTest() {
   } finally {
     globalThis.fetch = originalFetch;
   }
-  const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
+  const traceOk = existsSync(trace.metadataPath)
+    && trace.files.length === 2
+    && trace.responseIds.includes("resp_mock_trace")
+    && trace.files.every((item) => existsSync(item.path));
   const saved = saveBase64Image(base64, outputDir, "self_test_edit");
   const savedOk = !!saved?.path
     && existsSync(saved.path)
@@ -1632,13 +1771,15 @@ async function runEditResponsesSelfTest() {
       && resizedSaved.height === 1
       && !!resizedSaved.resizeError;
 
-  if (!explicitSizeOk || !payloadOk || !cloneOk || !fallbackOk || !savedOk || !resizePreserveOk) {
+  if (!explicitSizeOk || !payloadOk || !cloneOk || !fallbackOk || !traceOk || !savedOk || !resizePreserveOk) {
     console.error("Edit Responses self-test FAILED.");
     console.error(JSON.stringify({
       explicitSizeOk,
       payloadOk,
       cloneOk,
       fallbackOk,
+      traceOk,
+      trace,
       fetchCalls,
       savedOk,
       resizePreserveOk,
@@ -1958,9 +2099,13 @@ async function main() {
         console.error("Partial edit successes:");
         for (const [index, item] of result.results.entries()) {
           console.error(`${index + 1}. ${item.path} ${formatImageResult(item)}`);
+          const traceText = formatResponseTrace(item);
+          if (traceText) console.error(`Response trace: ${traceText}`);
         }
       }
       console.error(`Edit failed: ${result.error}`);
+      const traceText = formatResponseTrace(result.failures?.[0] || result);
+      if (traceText) console.error(`Response trace: ${traceText}`);
       process.exitCode = 1;
       return;
     }
@@ -1968,10 +2113,14 @@ async function main() {
     if (count > 1) {
       for (const [index, item] of result.results.entries()) {
         console.log(`${index + 1}. ${item.path} ${formatImageResult(item)}`);
+        const traceText = formatResponseTrace(item);
+        if (traceText) console.log(`Response trace: ${traceText}`);
       }
     } else {
       console.log(`Path: ${result.path}`);
       console.log(`Size: ${formatImageResult(result)}`);
+      const traceText = formatResponseTrace(result);
+      if (traceText) console.log(`Response trace: ${traceText}`);
     }
     console.log(`Source: ${result.sourceName}`);
     console.log(`Time: ${(result.elapsed / 1000).toFixed(1)}s`);
@@ -2036,12 +2185,16 @@ async function main() {
   });
   if (!result.ok) {
     console.error(`Generation failed: ${result.error}`);
+    const traceText = formatResponseTrace(result);
+    if (traceText) console.error(`Response trace: ${traceText}`);
     process.exit(1);
   }
   console.log(`Prompt: "${prompt}"`);
   console.log(`Path: ${result.path}`);
   console.log(`Size: ${formatImageResult(result)}`);
   console.log(`Time: ${(result.elapsed / 1000).toFixed(1)}s`);
+  const traceText = formatResponseTrace(result);
+  if (traceText) console.log(`Response trace: ${traceText}`);
 }
 
 main().catch((error) => {

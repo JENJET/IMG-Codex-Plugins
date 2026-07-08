@@ -350,6 +350,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 - 文生图默认走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
 - 图生图默认也走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
 - Responses 请求优先走 `background:true` + 轮询；中转不支持时回退 SSE 流式，再回退普通 JSON 请求
+- 每次 Responses 请求都会在输出目录记录 `*_trace.json` 和 `*.raw.txt`，用于保留 response id / raw response
 - Responses 顶层 `model` 默认不发送；只有 `textModel` 是非空字符串时才发送
 - `imageModelAsTopLevel: true` 时改为 Infinite-Canvas RS 兼容模式：顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
 - 图片工具模型默认是 `gpt-image-2`

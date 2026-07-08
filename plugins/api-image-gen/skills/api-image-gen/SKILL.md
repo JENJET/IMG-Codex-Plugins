@@ -189,6 +189,7 @@ Do not use `--legacy-edit` or `--edit-api images` here. They are disabled so the
 - Request size policy: use the default preset matrix, `--quality 1K`, a user-defined config `sizes` entry, or explicit `--size WIDTHxHEIGHT` / `WIDTH*HEIGHT`
 - Auth: `Authorization: Bearer <API Key>`
 - Responses body: JSON with optional `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; `imageModelAsTopLevel:true` puts `imageModel` in top-level `model` and omits `tools[0].model`; request mode follows the background -> SSE -> plain JSON fallback chain
+- Response tracing: every Responses request writes `*_trace.json` plus raw `*.raw.txt` files in the output directory so background response ids and raw upstream responses are recoverable
 - Edit Responses input: `input_text` plus one `input_image` data URL per source image, in order
 - Edit Responses tool: `type:"image_generation"`, `action:"edit"`, `output_format:"png"`, `moderation:"low"`, `partial_images:0`
 - Responses result parsing: final image can come from background/plain JSON `image_generation_call.result`, SSE `response.output_item.done`, or the last partial image event as a fallback
