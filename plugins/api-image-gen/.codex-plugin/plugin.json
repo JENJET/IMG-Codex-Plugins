@@ -1,6 +1,6 @@
 {
   "name": "api-image-gen",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Generate and edit images through the Responses API from Codex.",
   "author": {
     "name": "API Local"

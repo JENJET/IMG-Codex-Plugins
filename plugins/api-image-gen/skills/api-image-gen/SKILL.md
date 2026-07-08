@@ -43,13 +43,13 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --ap
 Persist API call config in the local config file with:
 
 ```bash
-node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-root "<API_ROOT>" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>"
-node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-profile "<PROFILE_NAME>" --api-root "<API_ROOT>" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-root "<API_ROOT>" --image-model "<IMAGE_MODEL>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-profile "<PROFILE_NAME>" --api-root "<API_ROOT>" --image-model "<IMAGE_MODEL>"
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --api-profile "<PROFILE_NAME>" --set-key "<USER_KEY>"
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-default-api "<PROFILE_NAME>"
 ```
 
-The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `responsesUrl`, `textModel`, and `imageModel`. `responsesUrl` overrides `apiRoot`; when only `apiRoot` is configured, the script appends `/v1/responses`. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
+The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `responsesUrl`, optional `textModel`, and `imageModel`. `textModel` may be omitted or set to an empty string; in both cases, the Responses request body does not send a top-level `model` field. A non-empty `textModel` is sent as the top-level `model`. `responsesUrl` overrides `apiRoot`; when only `apiRoot` is configured, the script appends `/v1/responses`. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
 
 ```json
 {
@@ -59,13 +59,11 @@ The config file can contain multiple API profiles under `apis` and choose the de
       "apiKey": "<USER_KEY>",
       "apiRoot": "https://api.openai.com",
       "responsesUrl": "https://api.openai.com/v1/responses",
-      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2"
     },
     "backup": {
       "apiKey": "<BACKUP_KEY>",
       "apiRoot": "https://backup.example.com",
-      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2"
     }
   }
@@ -142,7 +140,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-batch-mode --ratio
 The image-to-image route is fixed to Responses API in this plugin. Endpoint and model values below are defaults and may be overridden by CLI flags or config:
 
 - Endpoint: `POST https://api.openai.com/v1/responses`
-- Text model: `gpt-5.5`
+- Responses top-level `model`: omitted unless `textModel` is a non-empty string
 - Image tool: `gpt-image-2`
 - Tool action: `edit`
 - Input method: first one `input_text`, then one `input_image` block per source image, in order
@@ -179,7 +177,7 @@ Do not use `--legacy-edit` or `--edit-api images` here. They are disabled so the
 
 - Text-to-image: `POST https://api.openai.com/v1/responses`
 - Image edit: `POST https://api.openai.com/v1/responses`
-- Responses text model: `gpt-5.5`
+- Responses top-level `model`: omitted unless `textModel` is a non-empty string
 - Image generation tool model: `gpt-image-2`
 - The endpoint and model names above are defaults; the script can override them with CLI flags, `--api-profile`, or the local `defaultApi` / `apis` config
 - Request size policy: use the default preset matrix, `--quality 1K`, or a user-defined config `sizes` entry; do not request 4K, disabled ratios, or arbitrary `--size`

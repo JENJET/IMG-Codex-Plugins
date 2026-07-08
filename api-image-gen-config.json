@@ -5,13 +5,11 @@
       "apiKey": "你的OPENAI_API_KEY",
       "apiRoot": "https://api.openai.com",
       "responsesUrl": "https://api.openai.com/v1/responses",
-      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2"
     },
     "backup": {
       "apiKey": "你的备用API_KEY",
       "apiRoot": "https://backup.example.com",
-      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2"
     }
   },

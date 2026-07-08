@@ -9,7 +9,6 @@ const CONFIG_PATH = join(homedir(), ".codex", "api-image-gen-config.json");
 const DEFAULT_API_CONFIG = {
   apiRoot: "https://api.openai.com",
   responsesPath: "/v1/responses",
-  textModel: "gpt-5.5",
   imageModel: "gpt-image-2",
 };
 const NO_PROMPT_REVISION_INSTRUCTIONS = "You are a tool runner. Pass the user prompt to image_generation VERBATIM. DO NOT rewrite, expand, polish, or revise it in any way. Use the exact text the user gave.";
@@ -192,6 +191,10 @@ function resolveApiConfig(flags = {}, config = {}) {
     || normalizeConfigString(stored.apiRoot)
     || normalizeConfigString(config?.apiRoot)
     || DEFAULT_API_CONFIG.apiRoot;
+  const textModel = normalizeConfigString(flags.textModel)
+    || normalizeConfigString(selected.textModel)
+    || normalizeConfigString(stored.textModel)
+    || normalizeConfigString(config?.textModel);
   return {
     profile: resolveApiProfileSelection(flags, config).name,
     apiRoot,
@@ -200,11 +203,7 @@ function resolveApiConfig(flags = {}, config = {}) {
       || normalizeConfigString(stored.responsesUrl)
       || normalizeConfigString(config?.responsesUrl)
       || defaultResponsesUrl(apiRoot),
-    textModel: normalizeConfigString(flags.textModel)
-      || normalizeConfigString(selected.textModel)
-      || normalizeConfigString(stored.textModel)
-      || normalizeConfigString(config?.textModel)
-      || DEFAULT_API_CONFIG.textModel,
+    ...(textModel ? { textModel } : {}),
     imageModel: normalizeConfigString(flags.imageModel)
       || normalizeConfigString(selected.imageModel)
       || normalizeConfigString(stored.imageModel)
@@ -274,7 +273,7 @@ function summarizeApiProfiles(config = {}) {
       api: {
         apiRoot: profileConfig.apiRoot,
         responsesUrl: profileConfig.responsesUrl,
-        textModel: profileConfig.textModel,
+        ...(profileConfig.textModel ? { textModel: profileConfig.textModel } : {}),
         imageModel: profileConfig.imageModel,
       },
     }];
@@ -856,8 +855,7 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
   for (const dataURL of sourceDataURLs) {
     if (dataURL) content.push({ type: "input_image", image_url: dataURL });
   }
-  return {
-    model: apiConfig.textModel,
+  const body = {
     input: [{
       role: "user",
       content,
@@ -878,6 +876,8 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
     stream: true,
     instructions: [NO_PROMPT_REVISION_INSTRUCTIONS, aspectInstruction].filter(Boolean).join(" "),
   };
+  if (apiConfig.textModel) body.model = apiConfig.textModel;
+  return body;
 }
 
 function buildResponsesGenerationBody(prompt, size, apiConfig = resolveApiConfig()) {
@@ -1339,9 +1339,19 @@ async function runEditResponsesSelfTest() {
   ];
   const apiConfig = resolveApiConfig();
   const payload = buildResponsesEditBody("mock edit prompt", "1152x2048", sources.map((item) => item.dataURL), apiConfig);
+  const explicitModelPayload = buildResponsesEditBody(
+    "mock edit prompt",
+    "1152x2048",
+    sources.map((item) => item.dataURL),
+    { ...apiConfig, textModel: "mock-text-model" },
+  );
   const content = payload.input?.[0]?.content || [];
   const tool = payload.tools?.[0] || {};
-  const payloadOk = payload.model === apiConfig.textModel
+  const modelOk = apiConfig.textModel
+    ? payload.model === apiConfig.textModel
+    : !Object.prototype.hasOwnProperty.call(payload, "model");
+  const payloadOk = modelOk
+    && explicitModelPayload.model === "mock-text-model"
     && payload.stream === true
     && payload.store === false
     && content[0]?.type === "input_text"
@@ -1410,7 +1420,7 @@ function parseArgs(argv) {
     else if (value === "--set-api-config") args.flags.setApiConfig = true;
     else if (value === "--api-root" && argv[i + 1]) args.flags.apiRoot = argv[++i];
     else if (value === "--responses-url" && argv[i + 1]) args.flags.responsesUrl = argv[++i];
-    else if (value === "--text-model" && argv[i + 1]) args.flags.textModel = argv[++i];
+    else if (value === "--text-model" && i + 1 < argv.length) args.flags.textModel = argv[++i];
     else if (value === "--image-model" && argv[i + 1]) args.flags.imageModel = argv[++i];
     else if (value === "--set-quick-mode") args.flags.setQuickMode = true;
     else if (value === "--set-batch-mode") args.flags.setBatchMode = true;
@@ -1490,7 +1500,7 @@ DEFAULTS
   config: ${CONFIG_PATH} or API_IMAGE_GEN_CONFIG
   API root: ${DEFAULT_API_CONFIG.apiRoot}
   responses URL: ${defaultResponsesUrl(DEFAULT_API_CONFIG.apiRoot)}
-  responses text model: ${DEFAULT_API_CONFIG.textModel}
+  text model: not sent unless textModel is configured
   image model: ${DEFAULT_API_CONFIG.imageModel}
   edit API: responses only
   request quality: default ${DEFAULTS.quality}; supported ${Object.keys(sizeMatrix).join(", ")}

@@ -108,26 +108,29 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --get-config
 ```text
 API root: https://api.openai.com
 Responses URL: https://api.openai.com/v1/responses
-Responses text model: gpt-5.5
+Text model: 不配置或为空字符串则不发送
 Image tool model: gpt-image-2
 ```
 
 如果需要临时覆盖，可以直接传参数：
 
 ```powershell
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-root "https://example.com" --text-model "gpt-5.5" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-root "https://example.com" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --text-model "<TEXT_MODEL>"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-profile backup
 ```
 
 如果要持久保存到配置文件，可以使用：
 
 ```powershell
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-root "https://example.com" --text-model "gpt-5.5" --image-model "gpt-image-2"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile backup --api-root "https://backup.example.com" --text-model "gpt-5.5" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-root "https://example.com" --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile backup --api-root "https://backup.example.com" --image-model "gpt-image-2"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --api-profile backup --set-key "<备用API_KEY>"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-default-api backup
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 ```
+
+`textModel` 可以省略，也可以设为空字符串；这两种情况下请求体不会发送 Responses 顶层 `model` 字段。只有 `textModel` 是非空字符串时才会作为顶层 `model` 发送。
 
 也可以直接编辑配置文件。推荐使用 `defaultApi` + `apis` 配置多个 API 档位，`defaultApi` 指定默认使用哪一个：
 
@@ -139,13 +142,11 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
       "apiKey": "你的OPENAI_API_KEY",
       "apiRoot": "https://api.openai.com",
       "responsesUrl": "https://api.openai.com/v1/responses",
-      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2"
     },
     "backup": {
       "apiKey": "你的备用API_KEY",
       "apiRoot": "https://backup.example.com",
-      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2"
     }
   },
@@ -335,7 +336,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 
 - 文生图默认走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
 - 图生图默认也走 `POST https://api.openai.com/v1/responses`，可通过参数或配置文件覆盖
-- 文本模型默认是 `gpt-5.5`
+- Responses 顶层 `model` 默认不发送；只有 `textModel` 是非空字符串时才发送
 - 图片工具模型默认是 `gpt-image-2`
 - 图生图使用 `input_text + input_image` 的 Responses 方式
 - 多参考图图生图是多图上传，不是拼图，不走旧版 multipart Images API
