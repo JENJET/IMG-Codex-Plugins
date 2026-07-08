@@ -182,6 +182,10 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "海报图" --q
 ~/Pictures/api-image-gen
 ```
 
+如果上游返回的 PNG 像素尺寸和请求尺寸不完全一致，脚本会保留原始上游图片，并在同目录另存一张带 `_resized` 后缀的调整后图片；命令输出里的 `Path` 指向调整后的图片，`original saved at` 指向保留的原图。
+
+尺寸调整默认开启。需要关闭时，在文生图、批量出图或图生图命令后加 `--no-resize`；需要显式开启时可加 `--resize`。
+
 ### 1. 文生图
 
 最基础的文生图：

@@ -111,7 +111,7 @@ Supported default 2K aspects are fixed to `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `16
 
 The ratios `5:4`, `4:5`, `3:1`, and `1:3` are disabled in this plugin because repeated upstream tests returned `502` for them. Do not request them, and do not re-enable them unless new real tests prove they are stable.
 
-Upstream may return a near-aspect image with non-exact pixels. On Windows, the script center-crops/resizes the saved PNG to the requested `WIDTHxHEIGHT` and reports `resized from <original>`. Use `--no-resize` when testing the true upstream raster.
+Upstream may return a near-aspect image with non-exact pixels. On Windows, the script keeps the original upstream PNG, writes a center-cropped/resized copy beside it with a `_resized` suffix, and reports `resized from <original>` plus the original path. Resize is enabled by default for text-to-image, batch, and edit; pass `--no-resize` to keep the true upstream raster as the final output, or `--resize` to enable it explicitly.
 
 For same-prompt multi-image requests, use `--count 1..9`. For longer continuous runs, use `--repeat 1..50`. Each image is a separate Responses request:
 
@@ -188,7 +188,7 @@ Do not use `--legacy-edit` or `--edit-api images` here. They are disabled so the
 - Edit Responses input: `input_text` plus one `input_image` data URL per source image, in order
 - Edit Responses tool: `type:"image_generation"`, `action:"edit"`, `output_format:"png"`, `moderation:"low"`, `partial_images:0`
 - Responses result parsing: final image comes from SSE event `response.output_item.done` where `item.type` is `image_generation_call` and `item.result` is base64 image data
-- Saved PNG dimensions are normalized locally to the requested `size` unless `--no-resize` is used
+- Saved PNG dimensions are normalized locally to the requested `size` unless `--no-resize` is used; when resize occurs, `path` points to the `_resized` copy and `originalPath` points to the retained upstream PNG
 
 ## Verification
 

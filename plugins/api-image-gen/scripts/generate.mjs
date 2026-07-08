@@ -584,19 +584,22 @@ function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = n
   const buffer = Buffer.from(clean, "base64");
   const suffix = Math.random().toString(36).slice(2, 6);
   const numbered = index == null ? "" : `_${index}`;
-  const filename = `${prefix}_${timestamp()}${numbered}_${suffix}.png`;
-  const path = join(outputDir, filename);
-  writeFileSync(path, buffer);
-  const resizeInfo = ensurePngTargetSize(path, targetSize);
-  const finalBuffer = resizeInfo?.resized ? readFileSync(path) : buffer;
+  const baseName = `${prefix}_${timestamp()}${numbered}_${suffix}`;
+  const originalPath = join(outputDir, `${baseName}.png`);
+  const resizedPath = join(outputDir, `${baseName}_resized.png`);
+  writeFileSync(originalPath, buffer);
+  const resizeInfo = ensurePngTargetSize(originalPath, targetSize, resizedPath);
+  const finalPath = resizeInfo?.path || originalPath;
+  const finalBuffer = resizeInfo?.resized ? readFileSync(finalPath) : buffer;
   const dimensions = readPngDimensions(finalBuffer);
   return {
-    path,
+    path: finalPath,
     fileSize: `${(finalBuffer.length / 1024 / 1024).toFixed(2)}MB`,
     width: dimensions?.width || resizeInfo?.width || null,
     height: dimensions?.height || resizeInfo?.height || null,
     dimensions: dimensions ? `${dimensions.width}x${dimensions.height}` : null,
     resized: !!resizeInfo?.resized,
+    originalPath: resizeInfo?.originalPath || null,
     originalDimensions: resizeInfo?.originalWidth ? `${resizeInfo.originalWidth}x${resizeInfo.originalHeight}` : null,
     resizeError: resizeInfo?.error || null,
   };
@@ -606,6 +609,7 @@ function formatImageResult(result) {
   const parts = [result.fileSize].filter(Boolean);
   if (result.dimensions) parts.push(result.dimensions);
   if (result.resized && result.originalDimensions) parts.push(`resized from ${result.originalDimensions}`);
+  if (result.resized && result.originalPath) parts.push(`original saved at ${result.originalPath}`);
   if (result.resizeError) parts.push(`resize warning: ${result.resizeError}`);
   return parts.join(", ");
 }
@@ -702,17 +706,18 @@ function powershellSingleQuoted(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function resizePngWithPowerShell(path, width, height) {
+function resizePngWithPowerShell(path, width, height, outputPath = path) {
   const command = `
 $ErrorActionPreference = 'Stop'
 $Path = ${powershellSingleQuoted(path)}
+$OutputPath = ${powershellSingleQuoted(outputPath)}
 $TargetWidth = ${width}
 $TargetHeight = ${height}
 Add-Type -AssemblyName System.Drawing
 $image = [System.Drawing.Image]::FromFile($Path)
 $bitmap = $null
 $graphics = $null
-$tmp = "$Path.tmp.png"
+$tmp = "$OutputPath.tmp.png"
 try {
   $sourceWidth = $image.Width
   $sourceHeight = $image.Height
@@ -742,7 +747,7 @@ try {
   $image.Dispose(); $image = $null
   $bitmap.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
   $bitmap.Dispose(); $bitmap = $null
-  Move-Item -LiteralPath $tmp -Destination $Path -Force
+  Move-Item -LiteralPath $tmp -Destination $OutputPath -Force
 } finally {
   if ($graphics -ne $null) { $graphics.Dispose() }
   if ($bitmap -ne $null) { $bitmap.Dispose() }
@@ -765,7 +770,7 @@ try {
   return { ok: true };
 }
 
-function ensurePngTargetSize(path, targetSize) {
+function ensurePngTargetSize(path, targetSize, outputPath = path) {
   const target = parseSizeForAspect(targetSize);
   if (!target) return null;
 
@@ -784,7 +789,7 @@ function ensurePngTargetSize(path, targetSize) {
     };
   }
 
-  const resized = resizePngWithPowerShell(path, target.width, target.height);
+  const resized = resizePngWithPowerShell(path, target.width, target.height, outputPath);
   if (!resized.ok) {
     return {
       resized: false,
@@ -793,11 +798,13 @@ function ensurePngTargetSize(path, targetSize) {
       error: `Resize to ${targetSize} failed: ${resized.error}`,
     };
   }
-  const after = readPngDimensions(readFileSync(path));
+  const after = readPngDimensions(readFileSync(outputPath));
   return {
+    path: outputPath,
     resized: true,
     width: after?.width || target.width,
     height: after?.height || target.height,
+    originalPath: outputPath === path ? null : path,
     originalWidth: before.width,
     originalHeight: before.height,
   };
@@ -1356,13 +1363,31 @@ async function runEditResponsesSelfTest() {
   const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
   const saved = saveBase64Image(base64, outputDir, "self_test_edit");
   const savedOk = !!saved?.path && existsSync(saved.path) && saved.width === 1 && saved.height === 1;
+  const resizedSaved = saveBase64Image(base64, outputDir, "self_test_resize", null, "2x2");
+  const resizePreserveOk = process.platform === "win32"
+    ? !!resizedSaved?.path
+      && existsSync(resizedSaved.path)
+      && !!resizedSaved.originalPath
+      && existsSync(resizedSaved.originalPath)
+      && resizedSaved.path !== resizedSaved.originalPath
+      && resizedSaved.path.endsWith("_resized.png")
+      && resizedSaved.width === 2
+      && resizedSaved.height === 2
+      && resizedSaved.originalDimensions === "1x1"
+    : !!resizedSaved?.path
+      && existsSync(resizedSaved.path)
+      && resizedSaved.width === 1
+      && resizedSaved.height === 1
+      && !!resizedSaved.resizeError;
 
-  if (!payloadOk || !savedOk) {
+  if (!payloadOk || !savedOk || !resizePreserveOk) {
     console.error("Edit Responses self-test FAILED.");
     console.error(JSON.stringify({
       payloadOk,
       savedOk,
+      resizePreserveOk,
       saved,
+      resizedSaved,
     }, null, 2));
     return 1;
   }
@@ -1451,9 +1476,9 @@ GENERATE
   --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--no-resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}]
-  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}]    combine all sources in one Responses edit request
-  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--concurrency N]
+  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
+  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one Responses edit request
+  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--concurrency N] [--no-resize]
   image-to-image route is fixed to Responses API; --legacy-edit and --edit-api images are disabled
 
 TOOLS
