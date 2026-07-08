@@ -5,11 +5,13 @@ import { basename, dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
-const API_ROOT = "https://www.fhl.mom";
-const RESPONSES_URL = `${API_ROOT}/v1/responses`;
-const TEXT_MODEL = "gpt-5.5";
-const IMAGE_MODEL = "gpt-image-2";
-const CONFIG_PATH = join(homedir(), ".codex", "fhl-image-gen-config.json");
+const CONFIG_PATH = join(homedir(), ".codex", "api-image-gen-config.json");
+const DEFAULT_API_CONFIG = {
+  apiRoot: "https://api.openai.com",
+  responsesPath: "/v1/responses",
+  textModel: "gpt-5.5",
+  imageModel: "gpt-image-2",
+};
 const NO_PROMPT_REVISION_INSTRUCTIONS = "You are a tool runner. Pass the user prompt to image_generation VERBATIM. DO NOT rewrite, expand, polish, or revise it in any way. Use the exact text the user gave.";
 
 const MAX_GENERATION_COUNT = 9;
@@ -96,8 +98,8 @@ const DEFAULTS = {
   count: 1,
   concurrency: 3,
 };
-const FIXED_REQUEST_QUALITY = "2K";
-const FHL_SIZE_LIMIT_NOTICE = "由于官方请求限制FHL只能接收1K图像，详细计费以后台为准。";
+const DEFAULT_ENABLED_QUALITIES = new Set(["1K", "2K"]);
+const API_SIZE_LIMIT_NOTICE = "由于上游请求限制只能接收1K图像，详细计费以后台为准。";
 
 const RATIO_ALIASES = {
   square: "1:1",
@@ -105,27 +107,85 @@ const RATIO_ALIASES = {
   portrait: "3:4",
 };
 
-function loadConfig() {
-  if (!existsSync(CONFIG_PATH)) return null;
+function loadConfig(configPath = CONFIG_PATH) {
+  if (!existsSync(configPath)) return null;
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+    return JSON.parse(readFileSync(configPath, "utf8"));
   } catch {
     return null;
   }
 }
 
-function saveConfig(config) {
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+function saveConfig(config, configPath = CONFIG_PATH) {
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config, null, 2));
 }
 
-function getApiKey() {
-  const config = loadConfig();
+function getApiKey(config) {
   if (!config?.apiKey) {
-    console.error("ERROR: FHL API key is not configured. Run --set-key <key> first.");
+    console.error("ERROR: API key is not configured. Run --set-key <key> first.");
     process.exit(1);
   }
   return config.apiKey;
+}
+
+function normalizeConfigString(value) {
+  const normalized = String(value || "").trim();
+  return normalized || null;
+}
+
+function stripTrailingSlashes(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function defaultResponsesUrl(apiRoot) {
+  return `${stripTrailingSlashes(apiRoot || DEFAULT_API_CONFIG.apiRoot)}${DEFAULT_API_CONFIG.responsesPath}`;
+}
+
+function resolveConfigPath(flags = {}) {
+  return flags.configFile || process.env.API_IMAGE_GEN_CONFIG || CONFIG_PATH;
+}
+
+function resolveApiConfig(flags = {}, config = {}) {
+  const stored = config?.api || {};
+  const apiRoot = normalizeConfigString(flags.apiRoot)
+    || normalizeConfigString(stored.apiRoot)
+    || normalizeConfigString(config?.apiRoot)
+    || DEFAULT_API_CONFIG.apiRoot;
+  return {
+    apiRoot,
+    responsesUrl: normalizeConfigString(flags.responsesUrl)
+      || normalizeConfigString(stored.responsesUrl)
+      || normalizeConfigString(config?.responsesUrl)
+      || defaultResponsesUrl(apiRoot),
+    textModel: normalizeConfigString(flags.textModel)
+      || normalizeConfigString(stored.textModel)
+      || normalizeConfigString(config?.textModel)
+      || DEFAULT_API_CONFIG.textModel,
+    imageModel: normalizeConfigString(flags.imageModel)
+      || normalizeConfigString(stored.imageModel)
+      || normalizeConfigString(config?.imageModel)
+      || DEFAULT_API_CONFIG.imageModel,
+  };
+}
+
+function hasApiConfigFlag(flags = {}) {
+  return ["apiRoot", "responsesUrl", "textModel", "imageModel"].some((key) => flags[key] != null);
+}
+
+function applyApiConfigFlags(config, flags = {}) {
+  const next = { ...(config?.api || {}) };
+  if (flags.apiRoot != null) {
+    next.apiRoot = normalizeConfigString(flags.apiRoot);
+    if (flags.responsesUrl == null) delete next.responsesUrl;
+  }
+  if (flags.responsesUrl != null) next.responsesUrl = normalizeConfigString(flags.responsesUrl);
+  if (flags.textModel != null) next.textModel = normalizeConfigString(flags.textModel);
+  if (flags.imageModel != null) next.imageModel = normalizeConfigString(flags.imageModel);
+  for (const [key, value] of Object.entries(next)) {
+    if (!value) delete next[key];
+  }
+  return next;
 }
 
 function previewKey(key) {
@@ -134,13 +194,94 @@ function previewKey(key) {
   return `${key.slice(0, 8)}...${key.slice(-4)}`;
 }
 
-function normalizeQuality(quality) {
-  return FIXED_REQUEST_QUALITY;
+function cloneSizeMatrix() {
+  return Object.fromEntries(
+    Object.entries(SIZE_MATRIX)
+      .filter(([quality]) => DEFAULT_ENABLED_QUALITIES.has(quality))
+      .map(([quality, sizes]) => [quality, { ...sizes }]),
+  );
 }
 
-function shouldWarnFixedQuality(quality) {
+function normalizeQualityKey(quality) {
   const normalized = String(quality || "").trim().toUpperCase();
-  return normalized && normalized !== FIXED_REQUEST_QUALITY;
+  return normalized || null;
+}
+
+function customSizeEntries(rawEntries) {
+  if (!rawEntries) return [];
+  if (Array.isArray(rawEntries)) {
+    return rawEntries
+      .map((entry) => {
+        if (typeof entry === "string") return { label: entry, size: entry };
+        if (!entry || typeof entry !== "object") return null;
+        return {
+          label: entry.label || entry.name || entry.aspect || entry.ratio || entry.size,
+          size: entry.size || entry.value || entry.dimensions || entry.label || entry.name,
+        };
+      })
+      .filter(Boolean);
+  }
+  if (typeof rawEntries === "object") {
+    return Object.entries(rawEntries).map(([label, size]) => {
+      if (!size || typeof size !== "object") return { label, size };
+      return {
+        label: size.label || size.name || size.aspect || size.ratio || label,
+        size: size.size || size.value || size.dimensions || label,
+      };
+    });
+  }
+  return [];
+}
+
+function mergeCustomSizeMatrix(target, customSizes) {
+  if (!customSizes || typeof customSizes !== "object") return target;
+
+  if (Array.isArray(customSizes)) {
+    for (const entry of customSizes) {
+      if (!entry || typeof entry !== "object") continue;
+      const quality = normalizeQualityKey(entry.quality || DEFAULTS.quality);
+      if (!quality) continue;
+      const size = normalizeSizeString(entry.size || entry.value || entry.dimensions || entry.label || entry.name);
+      if (!size) continue;
+      const label = normalizeSizeString(entry.label || entry.name || entry.aspect || entry.ratio || size)
+        || normalizeRatio(entry.label || entry.name || entry.aspect || entry.ratio || size);
+      if (!label) continue;
+      if (!target[quality]) target[quality] = {};
+      target[quality][label] = size;
+    }
+    return target;
+  }
+
+  for (const [qualityName, entries] of Object.entries(customSizes)) {
+    const quality = normalizeQualityKey(qualityName);
+    if (!quality) continue;
+    if (!target[quality]) target[quality] = {};
+    for (const { label, size } of customSizeEntries(entries)) {
+      const normalizedSize = normalizeSizeString(size || label);
+      if (!normalizedSize) continue;
+      const normalizedLabel = normalizeSizeString(label) || normalizeRatio(label);
+      if (!normalizedLabel) continue;
+      target[quality][normalizedLabel] = normalizedSize;
+    }
+  }
+  return target;
+}
+
+function resolveSizeMatrix(config = {}) {
+  const matrix = cloneSizeMatrix();
+  mergeCustomSizeMatrix(matrix, config.sizeMatrix);
+  mergeCustomSizeMatrix(matrix, config.sizes);
+  return matrix;
+}
+
+function normalizeQuality(quality, sizeMatrix = resolveSizeMatrix()) {
+  const normalized = normalizeQualityKey(quality);
+  return normalized && sizeMatrix[normalized] ? normalized : DEFAULTS.quality;
+}
+
+function shouldWarnUnsupportedQuality(quality, sizeMatrix = resolveSizeMatrix()) {
+  const normalized = normalizeQualityKey(quality);
+  return !!normalized && !sizeMatrix[normalized];
 }
 
 function normalizeRatio(ratio) {
@@ -154,8 +295,21 @@ function ratioLabel(ratio) {
   return alias ? `${canonical} (${alias})` : canonical;
 }
 
-function supportedRatioText() {
-  return SUPPORTED_RATIOS.join(", ");
+function supportedRatiosForQuality(quality, sizeMatrix = resolveSizeMatrix()) {
+  return Object.keys(sizeMatrix[quality] || {}).filter((ratio) => !isDisabledRatio(ratio));
+}
+
+function supportedRatioText(quality = null, sizeMatrix = resolveSizeMatrix()) {
+  const normalizedQuality = quality ? normalizeQuality(quality, sizeMatrix) : null;
+  if (normalizedQuality) return supportedRatiosForQuality(normalizedQuality, sizeMatrix).join(", ");
+
+  const ratios = [];
+  for (const qualityName of Object.keys(sizeMatrix)) {
+    for (const ratio of supportedRatiosForQuality(qualityName, sizeMatrix)) {
+      if (!ratios.includes(ratio)) ratios.push(ratio);
+    }
+  }
+  return ratios.join(", ");
 }
 
 function normalizeSizeString(size) {
@@ -172,8 +326,13 @@ function aspectRatioForSize(size) {
   return `${parsed.width / divisor}:${parsed.height / divisor}`;
 }
 
+function aspectLabelForSize(size) {
+  const normalized = normalizeSizeString(size);
+  return normalized || aspectRatioForSize(size);
+}
+
 function supportedAspectFromSize(size) {
-  const aspect = aspectRatioForSize(size);
+  const aspect = aspectLabelForSize(size);
   return SUPPORTED_RATIOS.includes(aspect) ? aspect : null;
 }
 
@@ -181,12 +340,12 @@ function isDisabledRatio(ratio) {
   return DISABLED_RATIOS.has(normalizeRatio(ratio));
 }
 
-function resolveSize(quality, ratio, explicitSize = null) {
+function resolveSize(quality, ratio, explicitSize = null, sizeMatrix = resolveSizeMatrix()) {
   if (explicitSize) return normalizeSizeString(explicitSize);
-  const normalizedQuality = normalizeQuality(quality);
+  const normalizedQuality = normalizeQuality(quality, sizeMatrix);
   const normalizedRatio = normalizeRatio(ratio);
   if (!normalizedQuality) return null;
-  return SIZE_MATRIX[normalizedQuality]?.[normalizedRatio] || null;
+  return sizeMatrix[normalizedQuality]?.[normalizedRatio] || null;
 }
 
 function clampInteger(value, min, max, fallback) {
@@ -209,7 +368,7 @@ function timestamp() {
 }
 
 function resolveOutputDir(userDir) {
-  const dir = userDir || join(homedir(), "Pictures", "fhl-image-gen");
+  const dir = userDir || join(homedir(), "Pictures", "api-image-gen");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -565,23 +724,21 @@ function gcd(left, right) {
 function aspectInstructionForSize(size) {
   const parsed = parseSizeForAspect(size);
   if (!parsed) return "";
-  const divisor = gcd(parsed.width, parsed.height);
-  if (!divisor) return "";
-  const aspect = `${parsed.width / divisor}:${parsed.height / divisor}`;
+  const aspect = aspectLabelForSize(size);
+  if (!aspect) return "";
   const orientation = parsed.width === parsed.height
     ? "square"
     : parsed.width > parsed.height
       ? "landscape"
       : "portrait";
-  return `The selected output aspect ratio is ${aspect} (${orientation}). The image_generation result MUST use a ${aspect} canvas and must not return any other aspect ratio.`;
+  return `The selected output canvas is ${aspect} (${orientation}). The image_generation result MUST use a ${aspect} canvas and must not return any other aspect or size.`;
 }
 
 function aspectPromptSuffixForSize(size) {
   const parsed = parseSizeForAspect(size);
   if (!parsed) return "";
-  const divisor = gcd(parsed.width, parsed.height);
-  if (!divisor) return "";
-  const aspect = `${parsed.width / divisor}:${parsed.height / divisor}`;
+  const aspect = aspectLabelForSize(size);
+  if (!aspect) return "";
   if (parsed.width === parsed.height) {
     return `请严格按照 ${aspect} 正方形画幅生成最终图片，整张图片必须为 ${aspect} 比例。`;
   }
@@ -591,7 +748,7 @@ function aspectPromptSuffixForSize(size) {
   return `请严格按照 ${aspect} 横版画幅生成最终图片，整张图片必须为 ${aspect} 横向构图，不要正方形，不要竖版。`;
 }
 
-function buildResponsesImageBody(prompt, size, action, sourceDataURLs = []) {
+function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiConfig = resolveApiConfig()) {
   const aspectInstruction = aspectInstructionForSize(size);
   const aspectPromptSuffix = aspectPromptSuffixForSize(size);
   const promptText = aspectPromptSuffix ? `${prompt}\n\n${aspectPromptSuffix}` : prompt;
@@ -600,14 +757,14 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = []) {
     if (dataURL) content.push({ type: "input_image", image_url: dataURL });
   }
   return {
-    model: TEXT_MODEL,
+    model: apiConfig.textModel,
     input: [{
       role: "user",
       content,
     }],
     tools: [{
       type: "image_generation",
-      model: IMAGE_MODEL,
+      model: apiConfig.imageModel,
       action,
       size,
       quality: "auto",
@@ -623,26 +780,27 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = []) {
   };
 }
 
-function buildResponsesGenerationBody(prompt, size) {
-  return buildResponsesImageBody(prompt, size, "generate");
+function buildResponsesGenerationBody(prompt, size, apiConfig = resolveApiConfig()) {
+  return buildResponsesImageBody(prompt, size, "generate", [], apiConfig);
 }
 
-function buildResponsesEditBody(prompt, size, sourceDataURLs) {
-  return buildResponsesImageBody(prompt, size, "edit", sourceDataURLs);
+function buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig = resolveApiConfig()) {
+  return buildResponsesImageBody(prompt, size, "edit", sourceDataURLs, apiConfig);
 }
 
 async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
+  const apiConfig = options.apiConfig || resolveApiConfig();
   const start = Date.now();
   try {
-    const res = await requestWithTimeout(RESPONSES_URL, {
+    const res = await requestWithTimeout(apiConfig.responsesUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "text/event-stream, application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(buildResponsesGenerationBody(prompt, size)),
+      body: JSON.stringify(buildResponsesGenerationBody(prompt, size, apiConfig)),
     }, REQUEST_TIMEOUT_MS);
     if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res) };
 
@@ -703,18 +861,19 @@ function loadSourceImages(imagePaths) {
 
 async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
+  const apiConfig = options.apiConfig || resolveApiConfig();
   const start = Date.now();
   const sourceDataURLs = sources.map((item) => item.dataURL).filter(Boolean);
   const sourceName = summarizeSources(sources);
   try {
-    const res = await requestWithTimeout(RESPONSES_URL, {
+    const res = await requestWithTimeout(apiConfig.responsesUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "text/event-stream, application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(buildResponsesEditBody(prompt, size, sourceDataURLs)),
+      body: JSON.stringify(buildResponsesEditBody(prompt, size, sourceDataURLs, apiConfig)),
     }, REQUEST_TIMEOUT_MS);
     if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res), sourceName };
 
@@ -757,6 +916,7 @@ async function editImage(apiKey, imagePaths, prompt, size, outputDir, count = 1,
   const results = [];
   const failures = [];
   let retryCount = 0;
+  const apiConfig = options.apiConfig || resolveApiConfig();
   for (let index = 0; index < count; index += 1) {
     const result = await generateWithRetry(apiKey, prompt, size, outputDir, {
       index,
@@ -767,7 +927,9 @@ async function editImage(apiKey, imagePaths, prompt, size, outputDir, count = 1,
       generator: (_apiKey, _prompt, _size, _outputDir, context) => editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, {
         resize,
         saveIndex: count > 1 ? context.index + 1 : null,
+        apiConfig,
       }),
+      apiConfig,
     });
     retryCount += result.retries || 0;
     if (result.ok) {
@@ -802,6 +964,7 @@ async function generateWithRetry(apiKey, prompt, size, outputDir, options = {}) 
     retryDelayMs = RETRY_BACKOFF_MS,
     generator = generateImage,
     resize = true,
+    apiConfig = resolveApiConfig(),
     onRetryableFailure = () => {},
   } = options;
   let retries = 0;
@@ -809,7 +972,7 @@ async function generateWithRetry(apiKey, prompt, size, outputDir, options = {}) 
 
   while (true) {
     attempts += 1;
-    const result = await generator(apiKey, prompt, size, outputDir, { index, total, attempt: attempts, resize });
+    const result = await generator(apiKey, prompt, size, outputDir, { index, total, attempt: attempts, resize, apiConfig });
     if (result.ok) return { ...result, attempts, retries };
 
     const retryable = isRetryableError(result.error);
@@ -836,6 +999,7 @@ async function runBatch(apiKey, prompts, size, concurrency, outputDir, options =
     generator = generateImage,
     resize = true,
     returnReport = false,
+    apiConfig = resolveApiConfig(),
   } = options;
   const total = prompts.length;
   const results = new Array(total);
@@ -869,6 +1033,7 @@ async function runBatch(apiKey, prompts, size, concurrency, outputDir, options =
         retryDelayMs,
         generator,
         resize,
+        apiConfig,
         onRetryableFailure: triggerDowngrade,
       });
       retryCount += result.retries || 0;
@@ -1072,10 +1237,11 @@ async function runEditResponsesSelfTest() {
       dataURL: "data:image/jpeg;base64,bW9jay1zb3VyY2UtYg==",
     },
   ];
-  const payload = buildResponsesEditBody("mock edit prompt", "1152x2048", sources.map((item) => item.dataURL));
+  const apiConfig = resolveApiConfig();
+  const payload = buildResponsesEditBody("mock edit prompt", "1152x2048", sources.map((item) => item.dataURL), apiConfig);
   const content = payload.input?.[0]?.content || [];
   const tool = payload.tools?.[0] || {};
-  const payloadOk = payload.model === TEXT_MODEL
+  const payloadOk = payload.model === apiConfig.textModel
     && payload.stream === true
     && payload.store === false
     && content[0]?.type === "input_text"
@@ -1084,7 +1250,7 @@ async function runEditResponsesSelfTest() {
     && content[2]?.type === "input_image"
     && content[2]?.image_url === sources[1].dataURL
     && tool.type === "image_generation"
-    && tool.model === IMAGE_MODEL
+    && tool.model === apiConfig.imageModel
     && tool.action === "edit"
     && tool.size === "1152x2048"
     && tool.output_format === "png"
@@ -1094,7 +1260,7 @@ async function runEditResponsesSelfTest() {
   const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
   const raw = `data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"${pngB64}"}}\n`;
   const [base64] = extractImagesFromResponses(raw);
-  const outputDir = resolveOutputDir(join(tmpdir(), "fhl-image-gen-self-test"));
+  const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
   const saved = saveBase64Image(base64, outputDir, "self_test_edit");
   const savedOk = !!saved?.path && existsSync(saved.path) && saved.width === 1 && saved.height === 1;
 
@@ -1118,8 +1284,14 @@ function parseArgs(argv) {
   let i = 0;
   while (i < argv.length) {
     const value = argv[i];
-    if (value === "--get-config") args.flags.getConfig = true;
+    if (value === "--config" && argv[i + 1]) args.flags.configFile = argv[++i];
+    else if (value === "--get-config") args.flags.getConfig = true;
     else if (value === "--set-key" && argv[i + 1]) args.flags.setKey = argv[++i];
+    else if (value === "--set-api-config") args.flags.setApiConfig = true;
+    else if (value === "--api-root" && argv[i + 1]) args.flags.apiRoot = argv[++i];
+    else if (value === "--responses-url" && argv[i + 1]) args.flags.responsesUrl = argv[++i];
+    else if (value === "--text-model" && argv[i + 1]) args.flags.textModel = argv[++i];
+    else if (value === "--image-model" && argv[i + 1]) args.flags.imageModel = argv[++i];
     else if (value === "--set-quick-mode") args.flags.setQuickMode = true;
     else if (value === "--set-batch-mode") args.flags.setBatchMode = true;
     else if (value === "--prompt" && argv[i + 1]) args.prompts.push(argv[++i]);
@@ -1164,17 +1336,19 @@ function parseArgs(argv) {
   return args;
 }
 
-function printUsage() {
-  console.log(`FHL Image Gen
+function printUsage(sizeMatrix = resolveSizeMatrix()) {
+  console.log(`API Image Gen
 
 CONFIG
+  --config path.json
   --get-config
   --set-key <key>
+  --set-api-config [--api-root URL] [--responses-url URL] [--text-model MODEL] [--image-model MODEL]
   --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--api-root URL|--responses-url URL] [--text-model MODEL] [--image-model MODEL] [--ratio R|--aspect R] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
   --batch prompts.json [--ratio R|--aspect R] [--concurrency N] [--no-resize]
   --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--no-resize]
@@ -1191,46 +1365,50 @@ TOOLS
   --self-test-edit-responses
 
 DEFAULTS
-  API root: ${API_ROOT}
-  responses text model: ${TEXT_MODEL}
-  image model: ${IMAGE_MODEL}
+  config: ${CONFIG_PATH} or API_IMAGE_GEN_CONFIG
+  API root: ${DEFAULT_API_CONFIG.apiRoot}
+  responses URL: ${defaultResponsesUrl(DEFAULT_API_CONFIG.apiRoot)}
+  responses text model: ${DEFAULT_API_CONFIG.textModel}
+  image model: ${DEFAULT_API_CONFIG.imageModel}
   edit API: responses only
-  request quality: fixed ${FIXED_REQUEST_QUALITY}
-  output: ~/Pictures/fhl-image-gen
+  request quality: default ${DEFAULTS.quality}; supported ${Object.keys(sizeMatrix).join(", ")}
+  output: ~/Pictures/api-image-gen
   adaptive: on, concurrency ${DEFAULTS.concurrency}, retries ${MAX_RETRIES}, retry backoff ${RETRY_BACKOFF_MS / 1000}s
-  notice: ${FHL_SIZE_LIMIT_NOTICE}
+  notice: ${API_SIZE_LIMIT_NOTICE}
 
 RATIOS
-  ${supportedRatioText()}
+  ${supportedRatioText(null, sizeMatrix)}
   aliases: square=1:1, landscape=4:3, portrait=3:4
-  disabled after repeated real FHL 502 tests: 5:4, 4:5, 3:1, 1:3
+  disabled after repeated upstream 502 tests: 5:4, 4:5, 3:1, 1:3
 
 SIZE MATRIX
+  1K: 1:1 1024x1024, 3:2 1536x1024, 2:3 1024x1536, 4:3 1536x1152, 3:4 1152x1536, 16:9 1536x864, 9:16 864x1536, 2:1 1536x768, 1:2 768x1536, 7:4 1664x944, 4:7 944x1664
   2K: 1:1 2048x2048, 3:2 2048x1360, 2:3 1360x2048, 4:3 2048x1536, 3:4 1536x2048, 16:9 2048x1152, 9:16 1152x2048, 2:1 2048x1024, 1:2 1024x2048, 7:4 2208x1264, 4:7 1264x2208
+  custom sizes: add config.sizes. Example: { "1K": { "poster": "1024x1824" } }
   --size WxH is disabled. Use only --ratio/--aspect from the fixed supported list above.`);
 }
 
-function resolveGenerationParams(flags, modeConfig) {
+function resolveGenerationParams(flags, modeConfig, sizeMatrix = resolveSizeMatrix()) {
   const requestedQuality = flags.quality || modeConfig?.quality || DEFAULTS.quality;
-  const quality = normalizeQuality(requestedQuality);
-  if (shouldWarnFixedQuality(requestedQuality)) {
-    console.warn(`NOTICE: FHL Codex image generation is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+  const quality = normalizeQuality(requestedQuality, sizeMatrix);
+  if (shouldWarnUnsupportedQuality(requestedQuality, sizeMatrix)) {
+    console.warn(`NOTICE: Unsupported quality="${requestedQuality}"; using ${DEFAULTS.quality}. ${API_SIZE_LIMIT_NOTICE}`);
   }
 
   if (flags.size) {
-    console.error(`ERROR: --size is disabled in this plugin. Use only --aspect/--ratio. Supported ratios: ${supportedRatioText()}. Disabled ratios: 5:4, 4:5, 3:1, 1:3.`);
+    console.error(`ERROR: --size is disabled in this plugin. Use only --aspect/--ratio. Supported ratios: ${supportedRatioText(null, sizeMatrix)}. Disabled ratios: 5:4, 4:5, 3:1, 1:3.`);
     process.exit(1);
   }
 
   const requestedRatio = flags.aspect ?? flags.ratio ?? modeConfig?.ratio ?? DEFAULTS.ratio;
   let ratio = normalizeRatio(requestedRatio);
   if (isDisabledRatio(ratio)) {
-    console.error(`ERROR: Ratio="${requestedRatio}" is disabled in this plugin because repeated real FHL tests returned upstream 502 for 5:4, 4:5, 3:1, and 1:3. Use one of: ${supportedRatioText()}.`);
+    console.error(`ERROR: Ratio="${requestedRatio}" is disabled in this plugin because repeated upstream tests returned 502 for 5:4, 4:5, 3:1, and 1:3. Use one of: ${supportedRatioText(null, sizeMatrix)}.`);
     process.exit(1);
   }
-  const size = resolveSize(quality, ratio);
+  const size = resolveSize(quality, ratio, null, sizeMatrix);
   if (!size) {
-    console.error(`ERROR: Invalid ratio="${requestedRatio}". Supported ratios: ${supportedRatioText()}. Aliases: square, landscape, portrait.`);
+    console.error(`ERROR: Invalid ratio="${requestedRatio}" for quality ${quality}. Supported ratios for ${quality}: ${supportedRatioText(quality, sizeMatrix)}. Aliases: square, landscape, portrait.`);
     process.exit(1);
   }
   return { quality, ratio, size, explicitSize: false, requestedSize: flags.size || null };
@@ -1238,12 +1416,19 @@ function resolveGenerationParams(flags, modeConfig) {
 
 async function main() {
   const { prompts, flags } = parseArgs(process.argv.slice(2));
+  const configPath = resolveConfigPath(flags);
+  const config = loadConfig(configPath) || {};
+  const apiConfig = resolveApiConfig(flags, config);
+  const sizeMatrix = resolveSizeMatrix(config);
 
   if (flags.getConfig) {
-    const config = loadConfig();
     console.log(JSON.stringify({
+      configPath,
       hasKey: !!config?.apiKey,
       keyPreview: config?.apiKey ? previewKey(config.apiKey) : null,
+      api: apiConfig,
+      sizes: config?.sizes || config?.sizeMatrix || null,
+      supportedQualities: Object.keys(sizeMatrix),
       quickMode: config?.quickMode || null,
       batchMode: config?.batchMode || null,
     }, null, 2));
@@ -1251,58 +1436,66 @@ async function main() {
   }
 
   if (flags.setKey) {
-    const config = loadConfig() || {};
     config.apiKey = flags.setKey;
-    saveConfig(config);
-    console.log(`FHL API key saved: ${previewKey(flags.setKey)}`);
+    saveConfig(config, configPath);
+    console.log(`API key saved: ${previewKey(flags.setKey)}`);
+    return;
+  }
+
+  if (flags.setApiConfig) {
+    if (!hasApiConfigFlag(flags)) {
+      console.error("ERROR: --set-api-config requires at least one of --api-root, --responses-url, --text-model, or --image-model.");
+      process.exit(1);
+    }
+    config.api = applyApiConfigFlags(config, flags);
+    saveConfig(config, configPath);
+    console.log("API config saved:");
+    console.log(JSON.stringify(resolveApiConfig({}, config), null, 2));
     return;
   }
 
   if (flags.setQuickMode) {
-    const config = loadConfig() || {};
     const previous = config.quickMode || {};
     const requestedQuality = flags.quality || previous.quality || DEFAULTS.quality;
-    const quality = normalizeQuality(requestedQuality);
-    if (shouldWarnFixedQuality(requestedQuality)) {
-      console.warn(`NOTICE: Quick mode is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+    const quality = normalizeQuality(requestedQuality, sizeMatrix);
+    if (shouldWarnUnsupportedQuality(requestedQuality, sizeMatrix)) {
+      console.warn(`NOTICE: Unsupported quick mode quality="${requestedQuality}"; using ${DEFAULTS.quality}. ${API_SIZE_LIMIT_NOTICE}`);
     }
     const ratio = normalizeRatio(flags.aspect ?? flags.ratio ?? previous.ratio ?? DEFAULTS.ratio);
     const count = clampInteger(flags.count ?? previous.count, 1, MAX_GENERATION_COUNT, DEFAULTS.count);
-    const size = resolveSize(quality, ratio);
+    const size = resolveSize(quality, ratio, null, sizeMatrix);
     if (!size) {
-      console.error(`ERROR: Invalid ratio="${ratio}". Supported ratios: ${supportedRatioText()}.`);
+      console.error(`ERROR: Invalid ratio="${ratio}" for quality ${quality}. Supported ratios for ${quality}: ${supportedRatioText(quality, sizeMatrix)}.`);
       process.exit(1);
     }
     config.quickMode = { quality, ratio, count };
-    saveConfig(config);
+    saveConfig(config, configPath);
     console.log(`Quick mode saved: ${quality}, ${ratioLabel(ratio)} (${size}), count ${count}`);
     return;
   }
 
   if (flags.setBatchMode) {
-    const config = loadConfig() || {};
     const previous = config.batchMode || {};
     const requestedQuality = flags.quality || previous.quality || DEFAULTS.quality;
-    const quality = normalizeQuality(requestedQuality);
-    if (shouldWarnFixedQuality(requestedQuality)) {
-      console.warn(`NOTICE: Batch mode is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+    const quality = normalizeQuality(requestedQuality, sizeMatrix);
+    if (shouldWarnUnsupportedQuality(requestedQuality, sizeMatrix)) {
+      console.warn(`NOTICE: Unsupported batch mode quality="${requestedQuality}"; using ${DEFAULTS.quality}. ${API_SIZE_LIMIT_NOTICE}`);
     }
     const ratio = normalizeRatio(flags.aspect ?? flags.ratio ?? previous.ratio ?? DEFAULTS.ratio);
     const concurrency = clampInteger(flags.concurrency ?? previous.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
-    const size = resolveSize(quality, ratio);
+    const size = resolveSize(quality, ratio, null, sizeMatrix);
     if (!size) {
-      console.error(`ERROR: Invalid ratio="${ratio}". Supported ratios: ${supportedRatioText()}.`);
+      console.error(`ERROR: Invalid ratio="${ratio}" for quality ${quality}. Supported ratios for ${quality}: ${supportedRatioText(quality, sizeMatrix)}.`);
       process.exit(1);
     }
     config.batchMode = { quality, ratio, concurrency };
-    saveConfig(config);
+    saveConfig(config, configPath);
     console.log(`Batch mode saved: ${quality}, ${ratioLabel(ratio)} (${size}), concurrency ${concurrency}`);
     return;
   }
 
   if (flags.resolveSize) {
-    const config = loadConfig() || {};
-    const { quality, ratio, size, explicitSize } = resolveGenerationParams(flags, config.quickMode);
+    const { quality, ratio, size, explicitSize } = resolveGenerationParams(flags, config.quickMode, sizeMatrix);
     console.log(JSON.stringify({ quality, ratio, size, explicitSize }, null, 2));
     return;
   }
@@ -1318,12 +1511,11 @@ async function main() {
   }
 
   if (flags.help || (prompts.length === 0 && !flags.batchFile && !flags.edit)) {
-    printUsage();
+    printUsage(sizeMatrix);
     return;
   }
 
-  const apiKey = getApiKey();
-  const config = loadConfig() || {};
+  const apiKey = getApiKey(config);
   const outputDir = resolveOutputDir(flags.outputDir);
 
   if (flags.edit) {
@@ -1344,17 +1536,19 @@ async function main() {
       console.error("ERROR: Image-to-image is fixed to Responses API with input_image blocks. --legacy-edit and --edit-api images are disabled in this plugin.");
       process.exit(1);
     }
-    const { size } = resolveGenerationParams(flags, config.quickMode);
+    const { size } = resolveGenerationParams(flags, config.quickMode, sizeMatrix);
     if (images.length > 1 && flags.batchEdit) {
       const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
       process.exitCode = await runBatchEdit(apiKey, images, prompts[0], size, concurrency, outputDir, {
         resize: flags.resize !== false,
+        apiConfig,
       });
       return;
     }
     const count = clampInteger(flags.count, 1, MAX_EDIT_COUNT, 1);
     const result = await editImage(apiKey, images, prompts[0], size, outputDir, count, false, {
       resize: flags.resize !== false,
+      apiConfig,
     });
     if (!result.ok) {
       if (result.results?.length > 0) {
@@ -1383,7 +1577,7 @@ async function main() {
 
   const isBatch = !!flags.batchFile || !!flags.batchInline;
   const modeConfig = isBatch ? config.batchMode : config.quickMode;
-  const { size } = resolveGenerationParams(flags, modeConfig);
+  const { size } = resolveGenerationParams(flags, modeConfig, sizeMatrix);
 
   if (flags.batchFile) {
     const raw = readFileSync(flags.batchFile, "utf8");
@@ -1401,6 +1595,7 @@ async function main() {
     process.exit(await runBatch(apiKey, batchPrompts.map(String), size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
       resize: flags.resize !== false,
+      apiConfig,
     }));
   }
 
@@ -1413,6 +1608,7 @@ async function main() {
     process.exit(await runBatch(apiKey, prompts, size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
       resize: flags.resize !== false,
+      apiConfig,
     }));
   }
 
@@ -1426,12 +1622,14 @@ async function main() {
       adaptive: flags.adaptive !== false,
       isVariation: true,
       resize: flags.resize !== false,
+      apiConfig,
     }));
   }
 
   console.log("Generating...");
   const result = await generateImage(apiKey, prompt, size, outputDir, {
     resize: flags.resize !== false,
+    apiConfig,
   });
   if (!result.ok) {
     console.error(`Generation failed: ${result.error}`);

@@ -1,14 +1,14 @@
 {
-  "name": "fhl-plugins",
+  "name": "img-gen-plugins",
   "interface": {
-    "displayName": "FHL Plugins"
+    "displayName": "IMG Gen Plugins"
   },
   "plugins": [
     {
-      "name": "fhl-image-gen",
+      "name": "api-image-gen",
       "source": {
         "source": "local",
-        "path": "./plugins/fhl-image-gen"
+        "path": "./plugins/api-image-gen"
       },
       "policy": {
         "installation": "AVAILABLE",

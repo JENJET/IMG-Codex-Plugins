@@ -1,0 +1,22 @@
+{
+  "name": "api-image-gen",
+  "version": "0.1.0",
+  "description": "Generate and edit images through the Responses API from Codex.",
+  "author": {
+    "name": "API Local"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "API Image Gen",
+    "shortDescription": "Generate and edit images with Responses API.",
+    "longDescription": "A local Codex plugin for API image generation and image editing through the Responses API, including fixed 2K aspect presets, multi-reference input_image edits, batch generation, and adaptive runs.",
+    "developerName": "API Local",
+    "category": "Productivity",
+    "capabilities": ["Write"],
+    "brandColor": "#18A9B0",
+    "composerIcon": "./assets/composer-icon.png",
+    "logo": "./assets/plugin-logo.png",
+    "logoDark": "./assets/plugin-logo-dark.png",
+    "defaultPrompt": "Generate an image with API Image Gen."
+  }
+}
