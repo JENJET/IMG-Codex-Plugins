@@ -128,7 +128,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "一只钓鱼�
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "一只钓鱼的小猫" --repeat 50 --concurrency 4 --adaptive
 ```
 
-Adaptive concurrency is enabled by default. If retryable upstream errors occur (`502`, `503`, `504`, `524`, rate limits, no available account, account pool busy, temporarily unavailable), the failed item retries up to 3 times and future queued work drops to `concurrency=1`.
+Adaptive concurrency is enabled by default. If clearly not-submitted upstream errors occur (`429`, rate limits, no available account, account pool busy), the failed item retries up to 3 times and future queued work drops to `concurrency=1`. Local timeouts, `502`, `503`, `504`, and `524` are not retried automatically because the upstream may still complete the original generation.
 
 ## Batch Generate
 
@@ -181,6 +181,15 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --batch-edit --edit --im
 
 Use `--edit-api responses` or `--image-request-mode openai-responses` only when the configured upstream needs OpenAI RS / Responses mode. Otherwise keep the default standard mode.
 
+## Recover Pending Responses
+
+If a Responses background task times out locally but the trace has `responseIds`, or an image response was received but saving/downloading failed, recover it later without starting a new generation:
+
+```bash
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --recover-trace "<TRACE_JSON>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --recover-pending --output-dir "<OUTPUT_DIR>"
+```
+
 ## API Contract
 
 - Default text-to-image: `POST https://api.openai.com/v1/images/generations`
@@ -193,8 +202,8 @@ Use `--edit-api responses` or `--image-request-mode openai-responses` only when 
 - Auth: `Authorization: Bearer <API Key>`
 - Standard Images generation body: JSON with `model`, `prompt`, `size`, and optional `quality`
 - Standard Images edit body: multipart form with `model`, `prompt`, `size`, optional `quality`, and one `image` field per source image
-- Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; top-level `model` is `imageModel`, `tools[0].model` is omitted, and `tools[0].quality` is sent only for `low`, `medium`, or `high`; request mode follows the background -> SSE -> plain JSON fallback chain
-- Response tracing: API requests temporarily write `*_trace.json` plus raw `*.raw.txt` files in the output directory; successful image saves delete the corresponding logs, while failures keep them for troubleshooting. Responses mode also records response ids when available
+- Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; top-level `model` is `imageModel`, `tools[0].model` is omitted, and `tools[0].quality` is sent only for `low`, `medium`, or `high`; request mode uses background polling and does not automatically resubmit stream/plain fallback requests after a rejected or ambiguous background create
+- Response tracing: API requests temporarily write `*_trace.json` plus raw `*.raw.txt` files in the output directory; successful image saves delete the corresponding logs, and empty traces are removed. Failures with response ids or raw image outputs can be recovered with `--recover-trace` / `--recover-pending`; error-only traces are diagnostic records for cases where the upstream may have accepted the request but returned no recoverable id.
 - Responses result parsing: final image can come from background/plain JSON `image_generation_call.result`, SSE `response.output_item.done`, or the last partial image event as a fallback
 - Image saving accepts `b64_json`, `base64`, `image_generation_call.result`, common URL fields, nested `result.images`, and image links in Responses `output_text`; if one URL candidate cannot be downloaded, the script tries the next image candidate from the same response
 - Saved PNG dimensions are normalized locally to the requested `size` unless `--no-resize` is used; when resize occurs, `path` points to the `_resized` copy and `originalPath` points to the retained upstream PNG
@@ -224,5 +233,5 @@ When real generation or edit requests succeed, always show the successful saved 
 - Batch prompts: up to 20
 - Batch edit source images: up to 10
 - Concurrency: 1 to 9
-- Generation timeout: 180 seconds
-- Edit timeout: 180 seconds
+- Generation timeout: 300 seconds
+- Edit timeout: 300 seconds

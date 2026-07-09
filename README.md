@@ -251,7 +251,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河�
 
 - `--repeat` 范围是 `1..50`
 - 默认开启自适应并发
-- 如果上游出现 `502 / 503 / 504 / 524 / rate limit / account busy` 这类可重试错误，插件会自动重试，并把后续任务降到 `concurrency=1`
+- 如果上游出现 `429 / rate limit / account busy` 这类明确没有进入生成队列的错误，插件会自动重试，并把后续任务降到 `concurrency=1`；本地超时和 `502 / 503 / 504 / 524` 这类可能已被上游接收的请求不会自动重发
 - 目标是优先保证最终成功率，而不是硬顶并发
 
 如果你明确不想启用自适应：
@@ -300,6 +300,20 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --edit --image "C:\path\
 
 ```powershell
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --image "C:\path\one.png" --image "C:\path\two.png" --prompt "生成玩具海报图" --concurrency 3
+```
+
+### 8. 恢复后台 Responses 结果
+
+如果后台任务本地等待超时且 trace 里有 `responseIds`，或者图片响应已经返回但本地保存 / 下载失败，可以稍后恢复保存：
+
+```powershell
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --recover-trace "C:\path\response_generate_xxx_trace.json"
+```
+
+也可以扫描输出目录里的待恢复 trace：
+
+```powershell
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --recover-pending --output-dir "C:\path\output"
 ```
 
 ## 支持的比例与尺寸
@@ -368,8 +382,8 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --batch-edit --edit --im
 - 文生图默认走 `POST https://api.openai.com/v1/images/generations`，可通过参数或配置文件覆盖
 - 图生图默认走 `POST https://api.openai.com/v1/images/edits` multipart，参考图作为 `image` 字段上传
 - 设置 `imageRequestMode: "openai-responses"` 后，文生图和图生图都会走 `POST https://api.openai.com/v1/responses`
-- Responses 请求优先走 `background:true` + 轮询；中转不支持时回退 SSE 流式，再回退普通 JSON 请求
-- API 请求会临时记录 `*_trace.json` 和 `*.raw.txt`；成功保存图片后会删除对应日志，失败时保留用于排查；Responses 模式还会记录 response id
+- Responses 请求走 `background:true` + 轮询；为避免重复生成，background 被拒绝或创建请求无响应时不会自动再发 stream/plain 生成请求
+- API 请求会临时记录 `*_trace.json` 和 `*.raw.txt`；成功保存图片后会删除对应日志，空 trace 会删除；失败且 trace 有 `responseIds` 或 raw 里已有图片输出时可用 `--recover-trace` / `--recover-pending` 恢复，只有错误信息的 trace 只用于判断“已提交但没有拿到 id”的不可恢复情况
 - Responses 顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
 - 图片模型默认是 `gpt-image-2`
 - 图片 API 质量默认是 `imageQuality: "auto"`；需要强制质量时可设为 `low`、`medium` 或 `high`
@@ -439,7 +453,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 
 ### 5. 出图时报 502 / 503 / 504 / 524
 
-这通常是 API 上游暂时不稳定。连续出图场景下，插件会自动重试并降级并发。单次失败时，稍后再试通常更稳。
+这通常是 API 上游暂时不稳定。为避免重复生成，`502 / 503 / 504 / 524` 不会自动重发；只有 `429 / rate limit / account busy` 这类明确没有进入生成队列的错误会自动重试并降级并发。
 
 ### 6. 图生图失败
 

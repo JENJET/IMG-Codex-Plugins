@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -25,7 +25,7 @@ const MAX_BATCH_PROMPTS = 20;
 const MAX_EDIT_SOURCES = 10;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF_MS = 15_000;
-const REQUEST_TIMEOUT_MS = 180_000;
+const REQUEST_TIMEOUT_MS = 300_000;
 const RESPONSES_REJECT_STATUSES = new Set([400, 404, 405, 415, 422]);
 const RESPONSES_POLL_INTERVAL_MS = 5_000;
 const RESPONSES_POLL_TIMEOUT_MS = 1_500_000;
@@ -729,18 +729,26 @@ function isRetryableError(error) {
   const text = String(error || "").toLowerCase();
   return [
     "http 429",
-    "http 502",
-    "http 503",
-    "http 504",
-    "http 524",
-    "timeout",
     "rate limit",
     "too many requests",
     "no available account",
     "account pool busy",
     "please retry later",
-    "temporarily unavailable",
-    "overloaded",
+  ].some((pattern) => text.includes(pattern));
+}
+
+function isAmbiguousSubmissionError(error) {
+  const text = String(error || "").toLowerCase();
+  return [
+    "timeout",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 524",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "cloudflare timeout",
     "fetch failed",
     "socket hang up",
     "econnreset",
@@ -809,7 +817,7 @@ function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = n
   return saveImageBuffer(Buffer.from(clean, "base64"), outputDir, prefix, index, targetSize, "png");
 }
 
-function createResponseTrace(outputDir, prefix) {
+function createResponseTrace(outputDir, prefix, meta = {}) {
   if (!outputDir) return null;
   const suffix = Math.random().toString(36).slice(2, 6);
   const baseName = `${prefix || "response"}_${timestamp()}_${suffix}`;
@@ -820,7 +828,24 @@ function createResponseTrace(outputDir, prefix) {
     responseIds: [],
     files: [],
     errors: [],
+    outputPrefix: meta.outputPrefix || null,
+    targetSize: normalizeSizeString(meta.targetSize) || null,
   };
+}
+
+function hasResponseTraceData(trace) {
+  return !!trace && (
+    (Array.isArray(trace.responseIds) && trace.responseIds.length > 0)
+    || (Array.isArray(trace.files) && trace.files.length > 0)
+    || (Array.isArray(trace.errors) && trace.errors.length > 0)
+  );
+}
+
+function hasRecoverableTraceData(trace) {
+  return !!trace && (
+    (Array.isArray(trace.responseIds) && trace.responseIds.length > 0)
+    || (Array.isArray(trace.files) && trace.files.length > 0)
+  );
 }
 
 function traceStageSlug(stage) {
@@ -833,18 +858,19 @@ function addTraceResponseId(trace, id) {
   trace.responseIds.push(clean);
 }
 
-function collectResponseIds(value, ids = new Set(), isTopLevel = true) {
+function collectResponseIds(value, ids = new Set(), isTopLevel = true, parentKey = "") {
   if (!value || typeof value !== "object") return ids;
   if (Array.isArray(value)) {
-    for (const child of value) collectResponseIds(child, ids, false);
+    for (const child of value) collectResponseIds(child, ids, false, parentKey);
     return ids;
   }
   for (const [key, child] of Object.entries(value)) {
-    if ((key === "id" || key === "response_id") && typeof child === "string") {
+    if (["id", "response_id", "responseId", "responseID", "task_id", "taskId"].includes(key) && typeof child === "string") {
       const clean = child.trim();
-      if (isTopLevel || clean.startsWith("resp_")) ids.add(clean);
+      const responseContainer = /response|task/i.test(parentKey);
+      if (isTopLevel || clean.startsWith("resp_") || key !== "id" || responseContainer) ids.add(clean);
     } else if (child && typeof child === "object") {
-      collectResponseIds(child, ids, false);
+      collectResponseIds(child, ids, false, key);
     }
   }
   return ids;
@@ -862,12 +888,27 @@ function responseIdsFromRaw(raw) {
 }
 
 function writeResponseTraceMetadata(trace) {
-  if (!trace) return;
-  writeFileSync(trace.metadataPath, `${JSON.stringify({
+  if (!trace) return false;
+  if (!hasResponseTraceData(trace)) {
+    if (trace.metadataPath) {
+      try {
+        unlinkSync(trace.metadataPath);
+      } catch {
+        // Unrecoverable trace metadata is optional; ignore if it was never written.
+      }
+    }
+    return false;
+  }
+  const metadata = {
     responseIds: trace.responseIds,
     files: trace.files,
     errors: trace.errors || [],
-  }, null, 2)}\n`);
+  };
+  if (trace.outputDir) metadata.outputDir = trace.outputDir;
+  if (trace.outputPrefix) metadata.outputPrefix = trace.outputPrefix;
+  if (trace.targetSize) metadata.targetSize = trace.targetSize;
+  writeFileSync(trace.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+  return true;
 }
 
 function recordTraceError(trace, error) {
@@ -883,6 +924,9 @@ function recordTraceError(trace, error) {
 function recordRawResponse(trace, stage, raw, meta = {}) {
   if (!trace || raw == null) return null;
   const rawText = String(raw);
+  for (const id of responseIdsFromRaw(rawText)) addTraceResponseId(trace, id);
+  const imageOutputCount = extractImageOutputsFromResponses(rawText).length;
+  if (!hasRecoverableTraceData(trace) && imageOutputCount === 0) return null;
   const replaceKey = meta.replaceKey || null;
   let entry = replaceKey ? trace.files.find((item) => item.replaceKey === replaceKey) : null;
   if (!entry) {
@@ -899,15 +943,19 @@ function recordRawResponse(trace, stage, raw, meta = {}) {
   entry.route = meta.route || null;
   entry.httpStatus = meta.httpStatus || null;
   entry.bytes = Buffer.byteLength(rawText);
+  entry.imageOutputCount = imageOutputCount;
   entry.updatedAt = new Date().toISOString();
-  for (const id of responseIdsFromRaw(rawText)) addTraceResponseId(trace, id);
   writeResponseTraceMetadata(trace);
   return entry.path;
 }
 
 function responseTraceInfo(trace) {
   if (!trace) return {};
-  writeResponseTraceMetadata(trace);
+  if (!hasResponseTraceData(trace)) {
+    deleteResponseTrace(trace);
+    return {};
+  }
+  if (!writeResponseTraceMetadata(trace)) return {};
   const rawFiles = trace.files.map((item) => item.path).filter(Boolean);
   return {
     responseId: trace.responseIds[0] || null,
@@ -941,6 +989,188 @@ function formatResponseTrace(result) {
   const id = result.responseId ? `id=${result.responseId}, ` : "";
   const raw = result.rawResponsePath ? `, raw=${result.rawResponsePath}` : "";
   return `${id}trace=${result.responseTracePath}${raw}`;
+}
+
+function cleanResponseIds(ids) {
+  const seen = new Set();
+  const cleaned = [];
+  for (const id of Array.isArray(ids) ? ids : []) {
+    const value = String(id || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    cleaned.push(value);
+  }
+  return cleaned;
+}
+
+function responseTraceBaseName(tracePath) {
+  return basename(tracePath).replace(/_trace\.json$/i, "");
+}
+
+function outputPrefixForTrace(data, tracePath) {
+  const configured = normalizeConfigString(data?.outputPrefix);
+  if (configured) return configured;
+  const name = responseTraceBaseName(tracePath).toLowerCase();
+  if (name.includes("edit")) return "edit";
+  if (name.includes("generate")) return "img";
+  return "recovered";
+}
+
+function loadResponseTraceForRecovery(tracePath, options = {}) {
+  if (!existsSync(tracePath)) return { ok: false, error: `Trace file does not exist: ${tracePath}` };
+  let data;
+  try {
+    data = JSON.parse(readFileSync(tracePath, "utf8"));
+  } catch (error) {
+    return { ok: false, error: `Invalid trace JSON: ${responseTextError(error)}` };
+  }
+
+  const responseIds = cleanResponseIds(data?.responseIds);
+  const files = Array.isArray(data?.files) ? data.files : [];
+  if (responseIds.length === 0 && files.length === 0) {
+    return { ok: false, skipped: true, error: `Trace has no responseIds or raw files: ${tracePath}` };
+  }
+
+  const outputDir = resolveOutputDir(options.outputDir || data?.outputDir || dirname(tracePath));
+  const trace = {
+    outputDir,
+    baseName: responseTraceBaseName(tracePath),
+    metadataPath: tracePath,
+    responseIds,
+    files,
+    errors: Array.isArray(data?.errors) ? data.errors : [],
+    outputPrefix: outputPrefixForTrace(data, tracePath),
+    targetSize: options.resize === false ? null : normalizeSizeString(data?.targetSize),
+  };
+  return { ok: true, trace };
+}
+
+async function saveFromTraceRawFiles(trace) {
+  const files = Array.isArray(trace?.files) ? trace.files : [];
+  const errors = [];
+  for (const file of files.slice().reverse()) {
+    if (!file?.path || !existsSync(file.path)) continue;
+    let raw;
+    try {
+      raw = readFileSync(file.path, "utf8");
+    } catch (error) {
+      errors.push(`Cannot read raw file ${file.path}: ${responseTextError(error)}`);
+      continue;
+    }
+
+    const imageOutputs = extractImageOutputsFromResponses(raw);
+    if (imageOutputs.length === 0) continue;
+    const saved = await saveFirstImageOutput(imageOutputs, trace.outputDir, trace.outputPrefix || "recovered", null, trace.targetSize);
+    if (saved?.error) {
+      errors.push(`${saved.error} (raw=${file.path})`);
+      continue;
+    }
+    if (saved) return { ok: true, rawResponsePath: file.path, ...saved };
+  }
+  return { ok: false, error: errors.filter(Boolean).join("; ") || "No image output found in trace raw files" };
+}
+
+async function retrieveOpenAIResponse(apiKey, responsesUrl, id, trace = null) {
+  const retrieveUrl = `${responsesUrl.replace(/\/+$/, "")}/${encodeURIComponent(id)}`;
+  let res;
+  try {
+    res = await requestWithTimeout(retrieveUrl, {
+      method: "GET",
+      headers: responsesHeaders(apiKey),
+    }, REQUEST_TIMEOUT_MS);
+  } catch (error) {
+    recordTraceError(trace, error);
+    return { ok: false, error: `Responses recover request failed: ${responseTextError(error)} (id=${id})`, responseId: id, route: "recover" };
+  }
+
+  const raw = await res.text().catch(() => "");
+  recordRawResponse(trace, `recover-${id}`, raw, {
+    route: "recover",
+    httpStatus: res.status,
+    replaceKey: `recover-${id}`,
+  });
+  if (!res.ok) return { ok: false, error: `${formatErrorResponse(res.status, raw)} (id=${id})`, raw, responseId: id, route: "recover" };
+
+  const data = parseJsonText(raw);
+  const status = responseStatus(data);
+  if (status === "completed" || (!status && extractImageOutputsFromResponses(raw).length > 0)) {
+    return { ok: true, raw, responseId: id, route: "recover" };
+  }
+  if (isResponsesFailedStatus(status)) {
+    return { ok: false, error: `${responsesFailureMessage(data, `Responses task ${status}`)} (id=${id})`, raw, responseId: id, route: "recover" };
+  }
+  return { ok: false, pending: true, error: `Responses task ${status || "unknown"} is not completed (id=${id})`, raw, responseId: id, route: "recover" };
+}
+
+async function recoverResponseTrace(apiKey, responsesUrl, tracePath, options = {}) {
+  const loaded = loadResponseTraceForRecovery(tracePath, options);
+  if (!loaded.ok) return loaded;
+  const { trace } = loaded;
+  const errors = [];
+
+  const rawSaved = await saveFromTraceRawFiles(trace);
+  if (rawSaved.ok) {
+    const recoveredTracePath = trace.metadataPath;
+    deleteResponseTrace(trace);
+    return { ok: true, recovered: true, recoveredFromRaw: true, recoveredTracePath, ...rawSaved };
+  }
+  errors.push(rawSaved.error);
+
+  if (trace.responseIds.length > 0 && !apiKey) {
+    return {
+      ok: false,
+      error: "API key is not configured; response-id recovery needs API access, while raw-only recovery did not find a usable image output",
+      ...responseTraceInfo(trace),
+    };
+  }
+
+  for (const id of trace.responseIds) {
+    const response = await retrieveOpenAIResponse(apiKey, responsesUrl, id, trace);
+    if (!response.ok) {
+      errors.push(response.error);
+      continue;
+    }
+
+    const imageOutputs = extractImageOutputsFromResponses(response.raw);
+    const saved = await saveFirstImageOutput(imageOutputs, trace.outputDir, trace.outputPrefix || "recovered", null, trace.targetSize);
+    if (saved?.error) {
+      errors.push(`${saved.error} (id=${id})`);
+      continue;
+    }
+    if (!saved) {
+      errors.push(`No image result in recovered Responses response (id=${id})`);
+      continue;
+    }
+
+    const recoveredTracePath = trace.metadataPath;
+    deleteResponseTrace(trace);
+    return { ok: true, recovered: true, responseId: id, recoveredTracePath, ...saved };
+  }
+
+  return {
+    ok: false,
+    error: errors.filter(Boolean).join("; ") || `No recoverable response ids in trace: ${tracePath}`,
+    ...responseTraceInfo(trace),
+  };
+}
+
+function listResponseTracePaths(outputDir) {
+  try {
+    return readdirSync(outputDir)
+      .filter((name) => /_trace\.json$/i.test(name))
+      .map((name) => join(outputDir, name));
+  } catch {
+    return [];
+  }
+}
+
+async function runRecoverResponseTraces(apiKey, responsesUrl, tracePaths, options = {}) {
+  const results = [];
+  for (const tracePath of tracePaths) {
+    const result = await recoverResponseTrace(apiKey, responsesUrl, tracePath, options);
+    results.push({ tracePath, ...result });
+  }
+  return results;
 }
 
 function formatImageResult(result) {
@@ -1427,11 +1657,24 @@ function parseJsonText(raw) {
 }
 
 function responseStatus(data) {
-  return String(data?.status || "").toLowerCase();
+  return String(
+    data?.status
+    || data?.response?.status
+    || data?.task?.status
+    || data?.data?.status
+    || data?.result?.status
+    || "",
+  ).toLowerCase();
 }
 
 function responseId(data) {
-  return String(data?.id || "").trim();
+  const containers = [data, data?.response, data?.task, data?.data, data?.result];
+  for (const item of containers) {
+    const id = item?.id || item?.response_id || item?.responseId || item?.responseID || item?.task_id || item?.taskId;
+    const clean = String(id || "").trim();
+    if (clean) return clean;
+  }
+  return "";
 }
 
 function isResponsesProcessingStatus(status) {
@@ -1468,6 +1711,7 @@ async function pollOpenAIResponse(apiKey, responsesUrl, id, trace = null) {
     } catch (error) {
       transientFailures += 1;
       if (transientFailures > RESPONSES_POLL_MAX_TRANSIENT_FAILURES) {
+        recordTraceError(trace, error);
         return { ok: false, error: `Responses background poll failed: ${responseTextError(error)} (id=${id})` };
       }
       continue;
@@ -1511,12 +1755,25 @@ async function postOpenAIResponsesBackground(apiKey, responsesUrl, body, trace =
       body: JSON.stringify(backgroundBody),
     }, REQUEST_TIMEOUT_MS);
   } catch (error) {
-    return { fallback: true, reason: responseTextError(error) };
+    recordTraceError(trace, error);
+    return {
+      ok: false,
+      error: `Responses background create failed before a response id was returned; this task cannot be recovered unless the upstream exposes the id elsewhere (${responseTextError(error)})`,
+      route: "background",
+    };
   }
 
   const raw = await res.text().catch(() => "");
   recordRawResponse(trace, "background-create", raw, { route: "background", httpStatus: res.status });
-  if (RESPONSES_REJECT_STATUSES.has(res.status)) return { fallback: true, reason: `background rejected: HTTP ${res.status}` };
+  if (RESPONSES_REJECT_STATUSES.has(res.status)) {
+    return {
+      ok: false,
+      error: `${formatErrorResponse(res.status, raw)}; automatic Responses fallback is disabled to avoid duplicate image generation`,
+      raw,
+      route: "background",
+      responseId: responseId(parseJsonText(raw)),
+    };
+  }
   if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "background", responseId: responseId(parseJsonText(raw)) };
 
   const data = parseJsonText(raw);
@@ -1526,7 +1783,7 @@ async function postOpenAIResponsesBackground(apiKey, responsesUrl, body, trace =
   if (status === "completed") return { ok: true, raw, route: "background", responseId: id };
   if (isResponsesFailedStatus(status)) return { ok: false, error: responsesFailureMessage(data, `Responses background task ${status}`), raw, route: "background", responseId: id };
 
-  if (id && isResponsesProcessingStatus(status)) return pollOpenAIResponse(apiKey, responsesUrl, id, trace);
+  if (id && (!status || isResponsesProcessingStatus(status))) return pollOpenAIResponse(apiKey, responsesUrl, id, trace);
   return { ok: true, raw, route: "background", responseId: id };
 }
 
@@ -1540,6 +1797,7 @@ async function postOpenAIResponsesStream(apiKey, responsesUrl, body, trace = nul
       body: JSON.stringify(streamBody),
     }, REQUEST_TIMEOUT_MS);
   } catch (error) {
+    recordTraceError(trace, error);
     return { fallback: true, reason: responseTextError(error) };
   }
 
@@ -1560,6 +1818,7 @@ async function postOpenAIResponsesPlain(apiKey, responsesUrl, body, trace = null
       body: JSON.stringify(plainBody),
     }, REQUEST_TIMEOUT_MS);
   } catch (error) {
+    recordTraceError(trace, error);
     return { ok: false, error: responseTextError(error) };
   }
 
@@ -1603,6 +1862,7 @@ async function postOpenAIImagesJson(apiKey, url, body, trace = null) {
       body: JSON.stringify(body),
     }, REQUEST_TIMEOUT_MS);
   } catch (error) {
+    recordTraceError(trace, error);
     return { ok: false, error: responseTextError(error) };
   }
 
@@ -1621,6 +1881,7 @@ async function postOpenAIImagesMultipart(apiKey, url, formData, trace = null) {
       body: formData,
     }, REQUEST_TIMEOUT_MS);
   } catch (error) {
+    recordTraceError(trace, error);
     return { ok: false, error: responseTextError(error) };
   }
 
@@ -1633,7 +1894,7 @@ async function postOpenAIImagesMultipart(apiKey, url, formData, trace = null) {
 async function generateImageViaResponses(apiKey, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
-  const trace = createResponseTrace(outputDir, "response_generate");
+  const trace = createResponseTrace(outputDir, "response_generate", { outputPrefix: "img", targetSize: resize ? size : null });
   const start = Date.now();
   try {
     const response = await postOpenAIResponses(apiKey, apiConfig.responsesUrl, buildResponsesGenerationBody(prompt, size, apiConfig), trace);
@@ -1663,7 +1924,7 @@ async function generateImageViaResponses(apiKey, prompt, size, outputDir, option
 async function generateImageViaImages(apiKey, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
-  const trace = createResponseTrace(outputDir, "images_generate");
+  const trace = createResponseTrace(outputDir, "images_generate", { outputPrefix: "img", targetSize: resize ? size : null });
   const start = Date.now();
   try {
     const response = await postOpenAIImagesJson(apiKey, apiConfig.imageGenerationUrl, buildImagesGenerationBody(prompt, size, apiConfig), trace);
@@ -1741,7 +2002,7 @@ function loadSourceImages(imagePaths) {
 async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
-  const trace = createResponseTrace(outputDir, "response_edit");
+  const trace = createResponseTrace(outputDir, "response_edit", { outputPrefix: "edit", targetSize: resize ? size : null });
   const start = Date.now();
   const sourceDataURLs = sources.map((item) => item.dataURL).filter(Boolean);
   const sourceName = summarizeSources(sources);
@@ -1774,7 +2035,7 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
 async function editImageViaImagesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
   const resize = options.resize !== false;
   const apiConfig = options.apiConfig || resolveApiConfig();
-  const trace = createResponseTrace(outputDir, "images_edit");
+  const trace = createResponseTrace(outputDir, "images_edit", { outputPrefix: "edit", targetSize: resize ? size : null });
   const start = Date.now();
   const sourceName = summarizeSources(sources);
   try {
@@ -1887,7 +2148,8 @@ async function generateWithRetry(apiKey, prompt, size, outputDir, options = {}) 
     const result = await generator(apiKey, prompt, size, outputDir, { index, total, attempt: attempts, resize, apiConfig });
     if (result.ok) return { ...result, attempts, retries };
 
-    const retryable = isRetryableError(result.error);
+    const ambiguousSubmission = isAmbiguousSubmissionError(result.error);
+    const retryable = !ambiguousSubmission && isRetryableError(result.error);
     const fatal = isFatalError(result.error);
     if (retryable && retries < maxRetries) {
       retries += 1;
@@ -1897,7 +2159,7 @@ async function generateWithRetry(apiKey, prompt, size, outputDir, options = {}) 
       continue;
     }
 
-    return { ...result, attempts, retries, retryable, fatal };
+    return { ...result, attempts, retries, retryable, fatal, ambiguousSubmission };
   }
 }
 
@@ -2096,7 +2358,7 @@ async function runAdaptiveSelfTest() {
       retryCalls.set(context.index, count);
       await sleep(10);
       if (context.index === 1 && count === 1) {
-        return { ok: false, elapsed: 10, error: "HTTP 502: Cloudflare Bad Gateway" };
+        return { ok: false, elapsed: 10, error: "HTTP 429: Rate limit exceeded" };
       }
       return { ok: true, elapsed: 10, path: `mock://retryable-${context.index + 1}.png`, fileSize: "1.00KB" };
     },
@@ -2133,9 +2395,41 @@ async function runAdaptiveSelfTest() {
     && fatalReport.fatalError
     && fatalReport.failed >= 1;
 
-  if (!retryableOk || !fatalOk) {
+  console.log("");
+  console.log("Adaptive self-test: ambiguous timeout should not resubmit.");
+  let timeoutCalls = 0;
+  const timeoutResult = await generateWithRetry("mock-key", "mock timeout", "2048x1152", "(mock-output)", {
+    maxRetries: MAX_RETRIES,
+    retryDelayMs: 0,
+    generator: async () => {
+      timeoutCalls += 1;
+      return { ok: false, elapsed: 10, error: "Timeout (300s)" };
+    },
+  });
+  const timeoutOk = timeoutCalls === 1
+    && timeoutResult.attempts === 1
+    && timeoutResult.retries === 0
+    && timeoutResult.ambiguousSubmission
+    && !timeoutResult.retryable;
+
+  let noImageCalls = 0;
+  const noImageResult = await generateWithRetry("mock-key", "mock no image", "2048x1152", "(mock-output)", {
+    maxRetries: MAX_RETRIES,
+    retryDelayMs: 0,
+    generator: async () => {
+      noImageCalls += 1;
+      return { ok: false, elapsed: 10, error: "No image_generation_call result in Responses background" };
+    },
+  });
+  const noImageOk = noImageCalls === 1
+    && noImageResult.attempts === 1
+    && noImageResult.retries === 0
+    && noImageResult.ambiguousSubmission
+    && !noImageResult.retryable;
+
+  if (!retryableOk || !fatalOk || !timeoutOk || !noImageOk) {
     console.error("Adaptive self-test FAILED.");
-    console.error(JSON.stringify({ retryableReport, fatalReport }, null, 2));
+    console.error(JSON.stringify({ retryableReport, fatalReport, timeoutResult, timeoutCalls, noImageResult, noImageCalls }, null, 2));
     return 1;
   }
 
@@ -2193,6 +2487,13 @@ async function runOpenAIStandardSelfTest() {
   let requestOk = false;
   let generateResult = null;
   let editResult = null;
+  const testApiConfig = {
+    ...apiConfig,
+    imageRequestMode: "openai",
+    imageGenerationUrl: "https://example.com/v1/images/generations",
+    imageEditUrl: "https://example.com/v1/images/edits",
+    imageQuality: "medium",
+  };
   try {
     globalThis.fetch = async (url, init = {}) => {
       let parsedBody = null;
@@ -2211,13 +2512,6 @@ async function runOpenAIStandardSelfTest() {
         status: 200,
         headers: { "content-type": "application/json" },
       });
-    };
-    const testApiConfig = {
-      ...apiConfig,
-      imageRequestMode: "openai",
-      imageGenerationUrl: "https://example.com/v1/images/generations",
-      imageEditUrl: "https://example.com/v1/images/edits",
-      imageQuality: "medium",
     };
     generateResult = await generateImage("mock-key", "mock generate prompt", "2048x1024", outputDir, {
       apiConfig: testApiConfig,
@@ -2240,10 +2534,39 @@ async function runOpenAIStandardSelfTest() {
   } finally {
     globalThis.fetch = originalFetch;
   }
+  const emptyTrace = createResponseTrace(outputDir, "self_test_empty_trace");
+  const emptyTraceInfo = responseTraceInfo(emptyTrace);
+  const rawOnlyTrace = createResponseTrace(outputDir, "self_test_raw_only", { outputPrefix: "raw_recover" });
+  recordRawResponse(rawOnlyTrace, "images-generations", JSON.stringify({ data: [{ b64_json: pngB64 }] }), { route: "images", httpStatus: 200 });
+  const rawOnlyRecover = await recoverResponseTrace(null, "https://example.com/v1/responses", rawOnlyTrace.metadataPath, { resize: false });
+  let timeoutGenerateResult = null;
+  try {
+    globalThis.fetch = async () => {
+      const error = new Error("mock abort");
+      error.name = "AbortError";
+      throw error;
+    };
+    timeoutGenerateResult = await generateImageViaImages("mock-key", "mock timeout prompt", "2048x1024", outputDir, {
+      apiConfig: testApiConfig,
+      resize: false,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
   const traceOk = !generateResult?.responseTracePath
     && !generateResult?.rawResponsePath
     && !editResult?.responseTracePath
-    && !editResult?.rawResponsePath;
+    && !editResult?.rawResponsePath
+    && !emptyTraceInfo.responseTracePath
+    && !emptyTraceInfo.rawResponsePath
+    && !existsSync(emptyTrace.metadataPath)
+    && rawOnlyRecover?.ok
+    && rawOnlyRecover.recoveredFromRaw
+    && existsSync(rawOnlyRecover.path)
+    && !existsSync(rawOnlyTrace.metadataPath)
+    && !timeoutGenerateResult?.ok
+    && !!timeoutGenerateResult?.responseTracePath
+    && existsSync(timeoutGenerateResult.responseTracePath);
   const saved = await saveImageOutput(imageOutput, outputDir, "self_test_edit");
   const savedOk = !!saved?.path
     && existsSync(saved.path)
@@ -2274,6 +2597,10 @@ async function runOpenAIStandardSelfTest() {
       flexibleOk,
       requestOk,
       traceOk,
+      emptyTraceInfo,
+      emptyTracePath: emptyTrace.metadataPath,
+      rawOnlyRecover,
+      timeoutGenerateResult,
       fetchCalls,
       generateResult,
       editResult,
@@ -2291,7 +2618,7 @@ async function runOpenAIStandardSelfTest() {
 }
 
 async function runResponsesSelfTest() {
-  console.log("OpenAI Responses self-test: payload shape and fallback chain.");
+  console.log("OpenAI Responses self-test: payload shape and duplicate-submit guards.");
   const sources = [
     {
       sourceName: "mock-a.png",
@@ -2338,11 +2665,20 @@ async function runResponsesSelfTest() {
     output_text: "![result](https://example.com/result.png)",
   }));
   const textFallbackOk = textUrlOutput?.type === "url" && textUrlOutput.value === "https://example.com/result.png";
+  const responseIdParsingOk = responseIdsFromRaw(JSON.stringify({
+    responseId: "custom_response_id",
+    response: { id: "custom_nested_response_id" },
+    task_id: "custom_task_id",
+  })).length === 3
+    && responseId({ response: { id: "custom_nested_response_id" } }) === "custom_nested_response_id"
+    && responseId({ task_id: "custom_task_id" }) === "custom_task_id"
+    && responseStatus({ response: { status: "queued" } }) === "queued";
   const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
   const trace = createResponseTrace(outputDir, "self_test_response");
   const originalFetch = globalThis.fetch;
   const fetchCalls = [];
-  let fallbackOk = false;
+  let noDuplicateFallbackOk = false;
+  let backgroundTimeoutOk = false;
   try {
     globalThis.fetch = async (_url, init = {}) => {
       const parsedBody = init.body ? JSON.parse(init.body) : null;
@@ -2359,18 +2695,28 @@ async function runResponsesSelfTest() {
       });
     };
     const fallbackResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload, trace);
-    fallbackOk = fallbackResult.ok
-      && fallbackResult.route === "stream"
-      && fetchCalls.length === 2
+    noDuplicateFallbackOk = !fallbackResult.ok
+      && fallbackResult.route === "background"
+      && fetchCalls.length === 1
       && fetchCalls[0].body?.background === true
       && !Object.prototype.hasOwnProperty.call(fetchCalls[0].body, "stream")
       && !Object.prototype.hasOwnProperty.call(fetchCalls[0].body, "store")
-      && fetchCalls[1].body?.stream === true;
+      && String(fallbackResult.error || "").includes("duplicate image generation");
+    globalThis.fetch = async () => {
+      const error = new Error("mock abort");
+      error.name = "AbortError";
+      throw error;
+    };
+    const timeoutResult = await postOpenAIResponsesBackground("mock-key", "https://example.com/v1/responses", payload, createResponseTrace(outputDir, "self_test_timeout"));
+    backgroundTimeoutOk = !timeoutResult.ok
+      && !timeoutResult.fallback
+      && String(timeoutResult.error || "").includes("cannot be recovered");
   } finally {
     globalThis.fetch = originalFetch;
   }
+  recordRawResponse(trace, "stream", raw, { route: "stream", httpStatus: 200 });
   const traceOk = existsSync(trace.metadataPath)
-    && trace.files.length === 2
+    && trace.files.length === 1
     && trace.responseIds.includes("resp_mock_trace")
     && trace.files.every((item) => existsSync(item.path));
   const saved = saveBase64Image(base64, outputDir, "self_test_response");
@@ -2380,18 +2726,43 @@ async function runResponsesSelfTest() {
     && saved.height === 1
     && jsonBase64 === pngB64
     && partialBase64 === pngB64;
+  const recoverTrace = createResponseTrace(outputDir, "self_test_recover", { outputPrefix: "recovered" });
+  addTraceResponseId(recoverTrace, "resp_mock_recover");
+  writeResponseTraceMetadata(recoverTrace);
+  let recoverResult = null;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      id: "resp_mock_recover",
+      status: "completed",
+      output: [{ type: "image_generation_call", result: pngB64 }],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    recoverResult = await recoverResponseTrace("mock-key", "https://example.com/v1/responses", recoverTrace.metadataPath, { resize: false });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const recoverOk = recoverResult?.ok
+    && recoverResult.responseId === "resp_mock_recover"
+    && existsSync(recoverResult.path)
+    && !existsSync(recoverTrace.metadataPath);
 
-  if (!payloadOk || !textFallbackOk || !fallbackOk || !traceOk || !savedOk) {
+  if (!payloadOk || !textFallbackOk || !responseIdParsingOk || !noDuplicateFallbackOk || !backgroundTimeoutOk || !traceOk || !savedOk || !recoverOk) {
     console.error("OpenAI Responses self-test FAILED.");
     console.error(JSON.stringify({
       payloadOk,
       textFallbackOk,
-      fallbackOk,
+      responseIdParsingOk,
+      noDuplicateFallbackOk,
+      backgroundTimeoutOk,
       traceOk,
       trace,
       fetchCalls,
       savedOk,
       saved,
+      recoverOk,
+      recoverResult,
     }, null, 2));
     return 1;
   }
@@ -2437,6 +2808,8 @@ function parseArgs(argv) {
     else if (value === "--resize") args.flags.resize = true;
     else if (value === "--no-resize" || value === "--raw-output") args.flags.resize = false;
     else if (value === "--batch" && argv[i + 1]) args.flags.batchFile = argv[++i];
+    else if (value === "--recover-trace" && argv[i + 1]) args.flags.recoverTrace = argv[++i];
+    else if (value === "--recover-pending") args.flags.recoverPending = true;
     else if (value === "--batch-inline") {
       args.flags.batchInline = true;
       i++;
@@ -2493,6 +2866,10 @@ EDIT
   --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one edit request
   --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
   default route is OpenAI standard Images API; use --edit-api responses for Responses/RS
+
+RECOVER
+  --recover-trace path_to_trace.json [--api-profile NAME] [--no-resize]
+  --recover-pending [--output-dir DIR] [--api-profile NAME] [--no-resize]
 
 TOOLS
   --resolve-size --quality 2K --aspect 16:9
@@ -2681,6 +3058,44 @@ async function main() {
 
   if (flags.selfTestResponses) {
     process.exitCode = await runResponsesSelfTest();
+    return;
+  }
+
+  if (flags.recoverTrace || flags.recoverPending) {
+    const recoverDir = flags.recoverPending || flags.outputDir ? resolveOutputDir(flags.outputDir) : null;
+    const tracePaths = flags.recoverTrace ? [flags.recoverTrace] : listResponseTracePaths(recoverDir);
+    if (tracePaths.length === 0) {
+      console.log(`No response traces found: ${recoverDir}`);
+      return;
+    }
+
+    const apiKey = resolveApiKey(flags, config);
+    const results = await runRecoverResponseTraces(apiKey, apiConfig.responsesUrl, tracePaths, {
+      outputDir: flags.recoverTrace && flags.outputDir ? recoverDir : null,
+      resize: flags.resize !== false,
+    });
+    const recovered = results.filter((item) => item.ok);
+    const notRecovered = results.filter((item) => !item.ok && !item.skipped);
+    const skipped = results.filter((item) => item.skipped);
+
+    for (const result of results) {
+      if (result.ok) {
+        const idText = result.responseId ? ` id=${result.responseId}` : "";
+        const sourceText = result.recoveredFromRaw ? " from=raw" : "";
+        console.log(`Recovered: ${result.path} ${formatImageResult(result)}${idText}${sourceText}`);
+      } else if (result.skipped) {
+        console.log(`Skipped: ${result.tracePath} ${result.error}`);
+      } else {
+        console.error(`Not recovered: ${result.tracePath} ${result.error}`);
+        const traceText = formatResponseTrace(result);
+        if (traceText) console.error(`Response trace: ${traceText}`);
+      }
+    }
+    console.log(`Total traces: ${results.length}`);
+    console.log(`Recovered: ${recovered.length}`);
+    console.log(`Not recovered: ${notRecovered.length}`);
+    if (skipped.length > 0) console.log(`Skipped: ${skipped.length}`);
+    process.exitCode = notRecovered.length > 0 ? 1 : 0;
     return;
   }
 
