@@ -111,6 +111,7 @@ Image request mode: openai
 Image generation URL: https://api.openai.com/v1/images/generations
 Image edit URL: https://api.openai.com/v1/images/edits
 Responses URL: https://api.openai.com/v1/responses（仅 openai-responses 模式使用）
+Responses text model: gpt-5.5（仅 openai-responses 模式使用）
 Image model: gpt-image-2
 Image quality: auto
 ```
@@ -122,6 +123,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河�
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --image-quality high
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --api-profile manxiaobai
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --image-request-mode openai-responses
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河边钓鱼的小狗" --image-request-mode openai-responses --text-model "gpt-5.5"
 ```
 
 如果要持久保存到配置文件，可以使用：
@@ -130,13 +132,13 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "一只在河�
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-root "https://example.com" --image-model "gpt-image-2"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --image-quality high
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai --api-root "https://api.manxiaobai.online" --image-request-mode openai --image-model "gpt-image-2"
-node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai-rs --api-root "https://api.manxiaobai.online" --image-request-mode openai-responses --image-model "gpt-image-2"
+node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-api-config --api-profile manxiaobai-rs --api-root "https://api.manxiaobai.online" --image-request-mode openai-responses --text-model "gpt-5.5" --image-model "gpt-image-2"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --api-profile manxiaobai --set-key "<MANXIAOBAI_API_KEY>"
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --set-default-api manxiaobai
 node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 ```
 
-默认 `imageRequestMode` 是 `openai`，也就是标准 Images API。`imageQuality` 支持 `auto`、`low`、`medium`、`high`；`auto` 不显式发送质量字段，`low/medium/high` 会写进请求。进入 `openai-responses` 模式后，请求形状和 Infinite-Canvas 的 OpenAI RS 一致：Responses 顶层 `model` 使用 `imageModel`，`tools[0]` 不再单独发送模型。
+默认 `imageRequestMode` 是 `openai`，也就是标准 Images API。`imageQuality` 支持 `auto`、`low`、`medium`、`high`；`auto` 不显式发送质量字段，`low/medium/high` 会写进请求。`textModel` 只在 `openai-responses` 模式使用：未配置时默认使用 `gpt-5.5`，配置为非空字符串时使用配置值，显式配置为空字符串时 Responses 顶层 `model` 改用 `imageModel`；`tools[0].model` 始终使用 `imageModel`。标准 Images 模式不会使用 `textModel`。
 
 也可以直接编辑配置文件。推荐使用 `defaultApi` + `apis` 配置多个 API 档位，`defaultApi` 指定默认使用哪一个：
 
@@ -169,6 +171,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
       "apiKey": "你的MIKOTO_API_KEY",
       "apiRoot": "https://api.mikoto.vip",
       "imageRequestMode": "openai-responses",
+      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2",
       "imageQuality": "high"
     }
@@ -186,7 +189,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --get-config
 }
 ```
 
-示例里不要写真实 API Key。`imageRequestMode: "openai"` 会按 OpenAI 标准 Images API 请求：文生图自动拼接 `/v1/images/generations`，图生图自动拼接 `/v1/images/edits`。如果 `apiRoot` 已经以 `/v1` 结尾，则只补后面的 `/images/...` 路径。`imageRequestMode: "openai-responses"` 会走 `/v1/responses`，适合 Infinite-Canvas 风格 OpenAI RS 中转；这时才会使用 `responsesUrl`。`imageQuality` 的优先级也遵循参数高于配置文件，配置值可以写 `auto`、`low`、`medium`、`high`。`imageGenerationUrl`、`imageEditUrl`、`responsesUrl` 的优先级都高于 `apiRoot`，只在中转路径不是标准路径时才需要手动覆盖。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
+示例里不要写真实 API Key。`imageRequestMode: "openai"` 会按 OpenAI 标准 Images API 请求：文生图自动拼接 `/v1/images/generations`，图生图自动拼接 `/v1/images/edits`。如果 `apiRoot` 已经以 `/v1` 结尾，则只补后面的 `/images/...` 路径。`imageRequestMode: "openai-responses"` 会走 `/v1/responses`，适合 OpenAI RS 中转；这时才会使用 `responsesUrl` 和 `textModel`。未配置 `textModel` 时默认使用 `gpt-5.5`，显式写成 `"textModel": ""` 时顶层模型使用 `imageModel`。`imageQuality` 的优先级也遵循参数高于配置文件，配置值可以写 `auto`、`low`、`medium`、`high`。`imageGenerationUrl`、`imageEditUrl`、`responsesUrl` 的优先级都高于 `apiRoot`，只在中转路径不是标准路径时才需要手动覆盖。参数优先级高于配置文件，`--api-profile` 优先于 `defaultApi`。需要指定另一份配置文件时，可以使用 `--config path.json`，也可以设置 `API_IMAGE_GEN_CONFIG` 环境变量。旧的顶层 `apiKey` + `api` 写法仍然兼容。
 
 `sizes` 可以扩展可用尺寸，第一层是质量档位，第二层是你想在 `--aspect` / `--ratio` 里使用的名称，值是实际请求尺寸。上面的例子可以这样使用：
 
@@ -382,9 +385,9 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --recover-pending --outp
 - 文生图默认走 `POST https://api.openai.com/v1/images/generations`，可通过参数或配置文件覆盖
 - 图生图默认走 `POST https://api.openai.com/v1/images/edits` multipart，参考图作为 `image` 字段上传
 - 设置 `imageRequestMode: "openai-responses"` 后，文生图和图生图都会走 `POST https://api.openai.com/v1/responses`
-- Responses 请求走 `background:true` + 轮询；为避免重复生成，background 被拒绝或创建请求无响应时不会自动再发 stream/plain 生成请求
+- 仅 `openai-responses` 模式使用 fallback：请求先走 `background:true` + 轮询；如果 background 创建请求返回任意 HTTP `4xx` 或 `5xx` 且响应里没有 `responseId`，会移除 `background` 并切到 stream fallback 重试一次。响应里已有 `responseId` 时不重发生成请求：`completed` 直接消费结果，明确的失败状态立即返回失败，只有处理中或缺少状态时才使用该 ID 进入 GET 轮询。轮询仅对 HTTP `408/409/425/429` 和 `5xx` 暂时错误继续等待，其他 `4xx` 立即停止；创建请求超时或无响应时不重发，也不会继续发第三个 plain 请求
 - API 请求会临时记录 `*_trace.json` 和 `*.raw.txt`；成功保存图片后会删除对应日志，空 trace 会删除；失败且 trace 有 `responseIds` 或 raw 里已有图片输出时可用 `--recover-trace` / `--recover-pending` 恢复，只有错误信息的 trace 只用于判断“已提交但没有拿到 id”的不可恢复情况
-- Responses 顶层 `model` 使用 `imageModel`，tool 内不再发送 `model`
+- Responses 顶层 `model` 默认使用 `textModel`（未配置时是 `gpt-5.5`）；显式配置 `textModel: ""` 时改用 `imageModel`；图片工具的 `model` 始终使用 `imageModel`
 - 图片模型默认是 `gpt-image-2`
 - 图片 API 质量默认是 `imageQuality: "auto"`；需要强制质量时可设为 `low`、`medium` 或 `high`
 - 多参考图图生图是多图上传，不是拼图

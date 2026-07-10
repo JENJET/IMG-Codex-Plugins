@@ -18,7 +18,8 @@
     "mikotopro": {
       "apiKey": "你的MIKOTO_API_KEY",
       "apiRoot": "https://api.mikoto.vip",
-      "imageRequestMode": "openai",
+      "imageRequestMode": "openai-responses",
+      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2",
       "imageQuality": "auto"
     }

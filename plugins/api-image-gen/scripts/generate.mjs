@@ -12,6 +12,7 @@ const DEFAULT_API_CONFIG = {
   responsesPath: "/v1/responses",
   imageGenerationPath: "/v1/images/generations",
   imageEditPath: "/v1/images/edits",
+  textModel: "gpt-5.5",
   imageModel: "gpt-image-2",
   imageQuality: "auto",
 };
@@ -270,6 +271,17 @@ function resolveApiConfig(flags = {}, config = {}) {
     || normalizeImageRequestMode(config?.imageRequestMode)
     || normalizeImageRequestMode(config?.image_request_mode)
     || DEFAULT_API_CONFIG.imageRequestMode;
+  let textModel = DEFAULT_API_CONFIG.textModel;
+  for (const source of [flags, selected, stored, config]) {
+    if (!source || !Object.prototype.hasOwnProperty.call(source, "textModel")) continue;
+    textModel = String(source.textModel ?? "").trim();
+    break;
+  }
+  const imageModel = normalizeConfigString(flags.imageModel)
+    || normalizeConfigString(selected.imageModel)
+    || normalizeConfigString(stored.imageModel)
+    || normalizeConfigString(config?.imageModel)
+    || DEFAULT_API_CONFIG.imageModel;
   return {
     profile: selection.name,
     apiRoot,
@@ -301,11 +313,8 @@ function resolveApiConfig(flags = {}, config = {}) {
       || normalizeConfigString(stored.responsesUrl)
       || normalizeConfigString(config?.responsesUrl)
       || defaultResponsesUrl(apiRoot),
-    imageModel: normalizeConfigString(flags.imageModel)
-      || normalizeConfigString(selected.imageModel)
-      || normalizeConfigString(stored.imageModel)
-      || normalizeConfigString(config?.imageModel)
-      || DEFAULT_API_CONFIG.imageModel,
+    textModel,
+    imageModel,
     imageQuality: normalizeImageQuality(flags.imageQuality)
       || normalizeImageQuality(selected.imageQuality)
       || normalizeImageQuality(selected.image_quality)
@@ -325,7 +334,7 @@ function resolveApiKey(flags = {}, config = {}) {
 }
 
 function hasApiConfigFlag(flags = {}) {
-  return ["apiRoot", "imageRequestMode", "imageGenerationUrl", "imageEditUrl", "responsesUrl", "imageModel", "imageQuality"].some((key) => flags[key] != null);
+  return ["apiRoot", "imageRequestMode", "imageGenerationUrl", "imageEditUrl", "responsesUrl", "textModel", "imageModel", "imageQuality"].some((key) => flags[key] != null);
 }
 
 function applyApiConfigFlags(config, flags = {}) {
@@ -335,7 +344,6 @@ function applyApiConfigFlags(config, flags = {}) {
   delete next.api;
   delete next.apiKey;
   delete next.key;
-  delete next.textModel;
   delete next.imageModelAsTopLevel;
   if (flags.apiRoot != null) {
     next.apiRoot = normalizeConfigString(flags.apiRoot);
@@ -347,10 +355,11 @@ function applyApiConfigFlags(config, flags = {}) {
   if (flags.imageEditUrl != null) next.imageEditUrl = normalizeConfigString(flags.imageEditUrl);
   if (flags.imageRequestMode != null) next.imageRequestMode = normalizeImageRequestMode(flags.imageRequestMode);
   if (flags.responsesUrl != null) next.responsesUrl = normalizeConfigString(flags.responsesUrl);
+  if (Object.prototype.hasOwnProperty.call(flags, "textModel")) next.textModel = String(flags.textModel ?? "").trim();
   if (flags.imageModel != null) next.imageModel = normalizeConfigString(flags.imageModel);
   if (flags.imageQuality != null) next.imageQuality = normalizeImageQuality(flags.imageQuality);
   for (const [key, value] of Object.entries(next)) {
-    if (value == null || value === "") delete next[key];
+    if (value == null || (value === "" && key !== "textModel")) delete next[key];
   }
   if (profileName) {
     if (!config.apis || typeof config.apis !== "object" || Array.isArray(config.apis)) config.apis = {};
@@ -387,6 +396,7 @@ function summarizeApiProfiles(config = {}) {
       imageGenerationUrl: profileConfig.imageGenerationUrl,
       imageEditUrl: profileConfig.imageEditUrl,
       responsesUrl: profileConfig.responsesUrl,
+      textModel: profileConfig.textModel,
       imageModel: profileConfig.imageModel,
       imageQuality: profileConfig.imageQuality,
     }];
@@ -1580,6 +1590,7 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
   }
   const tool = {
     type: "image_generation",
+    model: apiConfig.imageModel,
     action,
     size,
     output_format: "png",
@@ -1589,7 +1600,7 @@ function buildResponsesImageBody(prompt, size, action, sourceDataURLs = [], apiC
   const requestQuality = imageQualityForRequest(apiConfig);
   if (requestQuality) tool.quality = requestQuality;
   const body = {
-    model: apiConfig.imageModel,
+    model: apiConfig.textModel || apiConfig.imageModel,
     input: [{
       role: "user",
       content,
@@ -1682,7 +1693,15 @@ function isResponsesProcessingStatus(status) {
 }
 
 function isResponsesFailedStatus(status) {
-  return ["failed", "cancelled", "canceled", "incomplete"].includes(status);
+  return ["failed", "cancelled", "canceled", "incomplete", "expired"].includes(status);
+}
+
+function isResponsesFallbackStatus(status) {
+  return Number.isInteger(status) && status >= 400 && status < 600;
+}
+
+function isResponsesPollRetryableStatus(status) {
+  return [408, 409, 425, 429].includes(status) || (Number.isInteger(status) && status >= 500 && status < 600);
 }
 
 function responsesFailureMessage(data, prefix) {
@@ -1724,6 +1743,9 @@ async function pollOpenAIResponse(apiKey, responsesUrl, id, trace = null) {
       replaceKey: "background-poll-latest",
     });
     if (!res.ok) {
+      if (!isResponsesPollRetryableStatus(res.status)) {
+        return { ok: false, error: `${formatErrorResponse(res.status, raw)} (id=${id})`, raw, route: "background", responseId: id };
+      }
       transientFailures += 1;
       if (transientFailures > RESPONSES_POLL_MAX_TRANSIENT_FAILURES) {
         return { ok: false, error: `${formatErrorResponse(res.status, raw)} (id=${id})`, raw, route: "background", responseId: id };
@@ -1765,14 +1787,27 @@ async function postOpenAIResponsesBackground(apiKey, responsesUrl, body, trace =
 
   const raw = await res.text().catch(() => "");
   recordRawResponse(trace, "background-create", raw, { route: "background", httpStatus: res.status });
-  if (RESPONSES_REJECT_STATUSES.has(res.status)) {
-    return {
-      ok: false,
-      error: `${formatErrorResponse(res.status, raw)}; automatic Responses fallback is disabled to avoid duplicate image generation`,
-      raw,
-      route: "background",
-      responseId: responseId(parseJsonText(raw)),
-    };
+  if (isResponsesFallbackStatus(res.status)) {
+    const data = parseJsonText(raw);
+    const id = responseId(data);
+    if (!id) {
+      return {
+        fallback: true,
+        fallbackOnce: true,
+        reason: formatErrorResponse(res.status, raw),
+        raw,
+        route: "background",
+        responseId: null,
+      };
+    }
+    addTraceResponseId(trace, id);
+    const status = responseStatus(data);
+    if (status === "completed") return { ok: true, raw, route: "background", responseId: id };
+    if (isResponsesFailedStatus(status)) {
+      return { ok: false, error: `${responsesFailureMessage(data, `Responses background task ${status}`)} (id=${id})`, raw, route: "background", responseId: id };
+    }
+    if (!status || isResponsesProcessingStatus(status)) return pollOpenAIResponse(apiKey, responsesUrl, id, trace);
+    return { ok: false, error: `Responses background task returned non-processing status "${status}" (id=${id})`, raw, route: "background", responseId: id };
   }
   if (!res.ok) return { ok: false, error: formatErrorResponse(res.status, raw), raw, route: "background", responseId: responseId(parseJsonText(raw)) };
 
@@ -1834,6 +1869,7 @@ async function postOpenAIResponses(apiKey, responsesUrl, body, trace = null) {
 
   const stream = await postOpenAIResponsesStream(apiKey, responsesUrl, body, trace);
   if (!stream.fallback) return stream;
+  if (background.fallbackOnce) return { ok: false, error: `Responses fallback failed: ${stream.reason}`, route: "stream" };
 
   return postOpenAIResponsesPlain(apiKey, responsesUrl, body, trace);
 }
@@ -2456,7 +2492,7 @@ async function runOpenAIStandardSelfTest() {
       dataURL: "data:image/jpeg;base64,bW9jay1zb3VyY2UtYg==",
     },
   ];
-  const apiConfig = resolveApiConfig({ imageQuality: "high" });
+  const apiConfig = resolveApiConfig({ imageQuality: "high", textModel: "standard-mode-must-ignore-text-model" });
   const explicitSizeOk = normalizeSizeString("2048x1024") === "2048x1024"
     && normalizeSizeString("2048X1024") === "2048x1024"
     && normalizeSizeString("2048*1024") === "2048x1024"
@@ -2618,7 +2654,7 @@ async function runOpenAIStandardSelfTest() {
 }
 
 async function runResponsesSelfTest() {
-  console.log("OpenAI Responses self-test: payload shape and duplicate-submit guards.");
+  console.log("OpenAI Responses self-test: payload shape, background retry, and duplicate-submit guards.");
   const sources = [
     {
       sourceName: "mock-a.png",
@@ -2637,10 +2673,36 @@ async function runResponsesSelfTest() {
   ];
   const apiConfig = resolveApiConfig({ imageRequestMode: "openai-responses", imageQuality: "high" });
   const payload = buildResponsesEditBody("mock edit prompt", "1152x2048", sources.map((item) => item.dataURL), apiConfig);
+  const configuredTextModel = "configured-text-model";
+  const configuredPayload = buildResponsesEditBody(
+    "mock edit prompt",
+    "1152x2048",
+    sources.map((item) => item.dataURL),
+    resolveApiConfig({ imageRequestMode: "openai-responses" }, { api: { textModel: configuredTextModel } }),
+  );
+  const emptyTextModelApiConfig = resolveApiConfig(
+    { imageRequestMode: "openai-responses" },
+    { api: { textModel: "", imageModel: "configured-image-model" } },
+  );
+  const emptyTextModelPayload = buildResponsesEditBody(
+    "mock edit prompt",
+    "1152x2048",
+    sources.map((item) => item.dataURL),
+    emptyTextModelApiConfig,
+  );
+  const savedEmptyTextModelConfig = applyApiConfigFlags({}, { textModel: "" });
+  const parsedEmptyTextModel = parseArgs(["--text-model", ""]);
   const content = payload.input?.[0]?.content || [];
   const tool = payload.tools?.[0] || {};
-  const payloadOk = payload.model === apiConfig.imageModel
-    && !Object.prototype.hasOwnProperty.call(tool, "model")
+  const payloadOk = payload.model === DEFAULT_API_CONFIG.textModel
+    && configuredPayload.model === configuredTextModel
+    && emptyTextModelApiConfig.textModel === ""
+    && emptyTextModelPayload.model === emptyTextModelApiConfig.imageModel
+    && emptyTextModelPayload.tools?.[0]?.model === emptyTextModelApiConfig.imageModel
+    && Object.prototype.hasOwnProperty.call(savedEmptyTextModelConfig.api, "textModel")
+    && savedEmptyTextModelConfig.api.textModel === ""
+    && parsedEmptyTextModel.flags.textModel === ""
+    && tool.model === apiConfig.imageModel
     && !Object.prototype.hasOwnProperty.call(payload, "stream")
     && payload.store === false
     && content[0]?.type === "input_text"
@@ -2676,32 +2738,128 @@ async function runResponsesSelfTest() {
   const outputDir = resolveOutputDir(join(tmpdir(), "api-image-gen-self-test"));
   const trace = createResponseTrace(outputDir, "self_test_response");
   const originalFetch = globalThis.fetch;
-  const fetchCalls = [];
-  let noDuplicateFallbackOk = false;
+  const backgroundRetryStatuses = [400, 404, 422, 499, 500, 502, 599];
+  const backgroundRetryCalls = {};
+  let backgroundRetryOk = isResponsesFallbackStatus(400)
+    && isResponsesFallbackStatus(499)
+    && isResponsesFallbackStatus(500)
+    && isResponsesFallbackStatus(599)
+    && !isResponsesFallbackStatus(399)
+    && !isResponsesFallbackStatus(600);
+  let fallbackStopsAfterOneOk = false;
+  let responseIdPollsWithoutRetryOk = false;
+  let failedResponseIdStopsPollingOk = false;
+  const pollStatusPolicyOk = [408, 409, 425, 429, 500, 599].every(isResponsesPollRetryableStatus)
+    && [400, 401, 403, 404, 422].every((status) => !isResponsesPollRetryableStatus(status));
+  let otherStatusNoRetryOk = false;
   let backgroundTimeoutOk = false;
   try {
+    for (const status of backgroundRetryStatuses) {
+      const calls = [];
+      backgroundRetryCalls[status] = calls;
+      globalThis.fetch = async (_url, init = {}) => {
+        const parsedBody = init.body ? JSON.parse(init.body) : null;
+        calls.push({ method: init.method, body: parsedBody });
+        if (calls.length === 1) {
+          return new Response(JSON.stringify({ error: { message: "background unsupported" } }), {
+            status,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(raw, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      };
+      const retryResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+      backgroundRetryOk = backgroundRetryOk
+        && retryResult.ok
+        && retryResult.route === "stream"
+        && calls.length === 2
+        && calls[0].body?.background === true
+        && !Object.prototype.hasOwnProperty.call(calls[0].body, "stream")
+        && !Object.prototype.hasOwnProperty.call(calls[0].body, "store")
+        && !Object.prototype.hasOwnProperty.call(calls[1].body, "background")
+        && calls[1].body?.stream === true
+        && calls[1].body?.store === false;
+    }
+    const fallbackFailureCalls = [];
     globalThis.fetch = async (_url, init = {}) => {
       const parsedBody = init.body ? JSON.parse(init.body) : null;
-      fetchCalls.push({ method: init.method, body: parsedBody });
-      if (fetchCalls.length === 1) {
-        return new Response(JSON.stringify({ error: { message: "background unsupported" } }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      return new Response(raw, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
+      fallbackFailureCalls.push({ method: init.method, body: parsedBody });
+      return new Response(JSON.stringify({ error: { message: "request rejected" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
       });
     };
-    const fallbackResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload, trace);
-    noDuplicateFallbackOk = !fallbackResult.ok
-      && fallbackResult.route === "background"
-      && fetchCalls.length === 1
-      && fetchCalls[0].body?.background === true
-      && !Object.prototype.hasOwnProperty.call(fetchCalls[0].body, "stream")
-      && !Object.prototype.hasOwnProperty.call(fetchCalls[0].body, "store")
-      && String(fallbackResult.error || "").includes("duplicate image generation");
+    const fallbackFailureResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+    fallbackStopsAfterOneOk = !fallbackFailureResult.ok
+      && fallbackFailureResult.route === "stream"
+      && fallbackFailureCalls.length === 2
+      && fallbackFailureCalls[0].body?.background === true
+      && fallbackFailureCalls[1].body?.stream === true
+      && !Object.prototype.hasOwnProperty.call(fallbackFailureCalls[1].body, "background")
+      && String(fallbackFailureResult.error || "").includes("fallback failed");
+    const responseIdCalls = [];
+    globalThis.fetch = async (_url, init = {}) => {
+      const parsedBody = init.body ? JSON.parse(init.body) : null;
+      responseIdCalls.push({ method: init.method, body: parsedBody });
+      const isCreate = responseIdCalls.length === 1;
+      return new Response(isCreate
+        ? JSON.stringify({ id: "resp_existing", status: "queued" })
+        : JSON.stringify({
+          id: "resp_existing",
+          status: "completed",
+          output: [{ type: "image_generation_call", result: pngB64 }],
+        }), {
+        status: isCreate ? 500 : 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const responseIdResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+    responseIdPollsWithoutRetryOk = responseIdResult.ok
+      && responseIdResult.route === "background"
+      && responseIdResult.responseId === "resp_existing"
+      && responseIdCalls.length === 2
+      && responseIdCalls[0].method === "POST"
+      && responseIdCalls[0].body?.background === true
+      && responseIdCalls[1].method === "GET"
+      && responseIdCalls[1].body == null;
+    const failedResponseIdCalls = [];
+    globalThis.fetch = async (_url, init = {}) => {
+      const parsedBody = init.body ? JSON.parse(init.body) : null;
+      failedResponseIdCalls.push({ method: init.method, body: parsedBody });
+      return new Response(JSON.stringify({
+        id: "resp_failed",
+        status: "failed",
+        error: { message: "task failed" },
+      }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const failedResponseIdResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+    failedResponseIdStopsPollingOk = !failedResponseIdResult.ok
+      && failedResponseIdResult.route === "background"
+      && failedResponseIdResult.responseId === "resp_failed"
+      && failedResponseIdCalls.length === 1
+      && failedResponseIdCalls[0].method === "POST"
+      && String(failedResponseIdResult.error || "").includes("task failed");
+    const otherStatusCalls = [];
+    globalThis.fetch = async (_url, init = {}) => {
+      const parsedBody = init.body ? JSON.parse(init.body) : null;
+      otherStatusCalls.push({ method: init.method, body: parsedBody });
+      return new Response(JSON.stringify({ error: { message: "request rejected" } }), {
+        status: 399,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const otherStatusResult = await postOpenAIResponses("mock-key", "https://example.com/v1/responses", payload);
+    otherStatusNoRetryOk = !otherStatusResult.ok
+      && otherStatusResult.route === "background"
+      && otherStatusCalls.length === 1
+      && otherStatusCalls[0].body?.background === true
+      && String(otherStatusResult.error || "").includes("HTTP 399");
     globalThis.fetch = async () => {
       const error = new Error("mock abort");
       error.name = "AbortError";
@@ -2748,17 +2906,22 @@ async function runResponsesSelfTest() {
     && existsSync(recoverResult.path)
     && !existsSync(recoverTrace.metadataPath);
 
-  if (!payloadOk || !textFallbackOk || !responseIdParsingOk || !noDuplicateFallbackOk || !backgroundTimeoutOk || !traceOk || !savedOk || !recoverOk) {
+  if (!payloadOk || !textFallbackOk || !responseIdParsingOk || !backgroundRetryOk || !fallbackStopsAfterOneOk || !responseIdPollsWithoutRetryOk || !failedResponseIdStopsPollingOk || !pollStatusPolicyOk || !otherStatusNoRetryOk || !backgroundTimeoutOk || !traceOk || !savedOk || !recoverOk) {
     console.error("OpenAI Responses self-test FAILED.");
     console.error(JSON.stringify({
       payloadOk,
       textFallbackOk,
       responseIdParsingOk,
-      noDuplicateFallbackOk,
+      backgroundRetryOk,
+      backgroundRetryCalls,
+      fallbackStopsAfterOneOk,
+      responseIdPollsWithoutRetryOk,
+      failedResponseIdStopsPollingOk,
+      pollStatusPolicyOk,
+      otherStatusNoRetryOk,
       backgroundTimeoutOk,
       traceOk,
       trace,
-      fetchCalls,
       savedOk,
       saved,
       recoverOk,
@@ -2790,6 +2953,7 @@ function parseArgs(argv) {
     else if (value === "--image-generation-url" && argv[i + 1]) args.flags.imageGenerationUrl = argv[++i];
     else if (value === "--image-edit-url" && argv[i + 1]) args.flags.imageEditUrl = argv[++i];
     else if (value === "--responses-url" && argv[i + 1]) args.flags.responsesUrl = argv[++i];
+    else if (value === "--text-model" && i + 1 < argv.length) args.flags.textModel = argv[++i];
     else if (value === "--image-model" && argv[i + 1]) args.flags.imageModel = argv[++i];
     else if (value === "--image-quality" && argv[i + 1]) args.flags.imageQuality = argv[++i];
     else if (value === "--set-quick-mode") args.flags.setQuickMode = true;
@@ -2850,19 +3014,19 @@ CONFIG
   --api-profile NAME
   --set-key <key>
   --set-default-api NAME
-  --set-api-config [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--image-model MODEL] [--image-quality auto|low|medium|high]
+  --set-api-config [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-model MODEL] [--image-quality auto|low|medium|high]
   --set-api-config [--image-generation-url URL] [--image-edit-url URL] [--responses-url URL]
   --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--image-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
   --batch prompts.json [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
   --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--image-request-mode openai|openai-responses] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
+  --edit --image path.png --prompt "..." [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
   --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one edit request
   --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
   default route is OpenAI standard Images API; use --edit-api responses for Responses/RS
@@ -2885,6 +3049,7 @@ DEFAULTS
   image generation URL: ${defaultImageGenerationUrl(DEFAULT_API_CONFIG.apiRoot)}
   image edit URL: ${defaultImageEditUrl(DEFAULT_API_CONFIG.apiRoot)}
   responses URL: ${defaultResponsesUrl(DEFAULT_API_CONFIG.apiRoot)}
+  responses text model: ${DEFAULT_API_CONFIG.textModel} (openai-responses only; explicit empty string uses image model)
   image model: ${DEFAULT_API_CONFIG.imageModel}
   image API quality: ${DEFAULT_API_CONFIG.imageQuality} (auto is not sent; low/medium/high are sent)
   edit API: openai standard by default; openai-responses optional
@@ -2990,7 +3155,7 @@ async function main() {
 
   if (flags.setApiConfig) {
     if (!hasApiConfigFlag(flags)) {
-      console.error("ERROR: --set-api-config requires at least one of --api-root, --image-request-mode, --image-generation-url, --image-edit-url, --responses-url, --image-model, or --image-quality.");
+      console.error("ERROR: --set-api-config requires at least one of --api-root, --image-request-mode, --image-generation-url, --image-edit-url, --responses-url, --text-model, --image-model, or --image-quality.");
       process.exit(1);
     }
     applyApiConfigFlags(config, flags);

@@ -37,6 +37,7 @@ API call defaults are configurable. Use one-off CLI overrides when the user asks
 
 ```bash
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-root "<API_ROOT>" --image-request-mode "openai" --image-model "<IMAGE_MODEL>"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --image-request-mode "openai-responses" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>"
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-profile "<PROFILE_NAME>"
 ```
 
@@ -44,12 +45,12 @@ Persist API call config in the local config file with:
 
 ```bash
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-root "<API_ROOT>" --image-request-mode "openai" --image-model "<IMAGE_MODEL>" --image-quality "auto"
-node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-profile "<PROFILE_NAME>" --api-root "<API_ROOT>" --image-request-mode "openai" --image-model "<IMAGE_MODEL>" --image-quality "high"
+node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-api-config --api-profile "<PROFILE_NAME>" --api-root "<API_ROOT>" --image-request-mode "openai-responses" --text-model "<TEXT_MODEL>" --image-model "<IMAGE_MODEL>" --image-quality "high"
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --api-profile "<PROFILE_NAME>" --set-key "<USER_KEY>"
 node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --set-default-api "<PROFILE_NAME>"
 ```
 
-The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `imageRequestMode`, optional endpoint overrides (`imageGenerationUrl`, `imageEditUrl`, `responsesUrl`), `imageModel`, and `imageQuality`. `imageRequestMode` defaults to `openai`, which sends text-to-image to `/v1/images/generations` and image-to-image to multipart `/v1/images/edits`. `imageQuality` accepts `auto`, `low`, `medium`, or `high`; `auto` means the request does not explicitly send a quality field. Set `imageRequestMode:"openai-responses"` for Infinite-Canvas OpenAI RS style `/v1/responses`; in this mode the Responses top-level `model` is the image model and `tools[0].model` is omitted. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
+The config file can contain multiple API profiles under `apis` and choose the default with `defaultApi`. Each profile can contain `apiKey`, `apiRoot`, `imageRequestMode`, optional endpoint overrides (`imageGenerationUrl`, `imageEditUrl`, `responsesUrl`), `textModel`, `imageModel`, and `imageQuality`. `imageRequestMode` defaults to `openai`, which sends text-to-image to `/v1/images/generations` and image-to-image to multipart `/v1/images/edits`. `imageQuality` accepts `auto`, `low`, `medium`, or `high`; `auto` means the request does not explicitly send a quality field. Set `imageRequestMode:"openai-responses"` for OpenAI RS style `/v1/responses`; only this mode uses `textModel`. The Responses top-level `model` uses a non-empty configured `textModel`, defaults to `gpt-5.5` when the field is absent, and uses `imageModel` when `textModel` is explicitly an empty string. `tools[0].model` always uses `imageModel`. Parameters override the config file, and `--api-profile` overrides `defaultApi`. Use `--config <FILE>` or `API_IMAGE_GEN_CONFIG` to point at another config file. The legacy top-level `apiKey` plus `api` object remains supported.
 
 ```json
 {
@@ -73,6 +74,7 @@ The config file can contain multiple API profiles under `apis` and choose the de
       "apiKey": "<MIKOTO_KEY>",
       "apiRoot": "https://api.mikoto.vip",
       "imageRequestMode": "openai-responses",
+      "textModel": "gpt-5.5",
       "imageModel": "gpt-image-2",
       "imageQuality": "high"
     }
@@ -152,7 +154,7 @@ The image-to-image route defaults to OpenAI-standard Images API. Endpoint and mo
 - Default endpoint: `POST https://api.openai.com/v1/images/edits`
 - Default body: multipart form with `model`, `prompt`, `size`, and one `image` field per source image
 - Responses endpoint when `imageRequestMode:"openai-responses"`: `POST https://api.openai.com/v1/responses`
-- Responses top-level `model`: `imageModel`; `tools[0].model` is omitted
+- Responses top-level `model`: non-empty configured `textModel`, default `gpt-5.5` when absent, or `imageModel` when `textModel` is explicitly empty; `tools[0].model` uses `imageModel`
 - This is not a collage step
 
 Default image-to-image edits use standard Images API:
@@ -195,6 +197,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --recover-pending --outp
 - Default text-to-image: `POST https://api.openai.com/v1/images/generations`
 - Default image edit: `POST https://api.openai.com/v1/images/edits`
 - Optional Responses mode: `POST https://api.openai.com/v1/responses` when `imageRequestMode:"openai-responses"`
+- Responses text model: configured non-empty `textModel`, defaulting to `gpt-5.5` when absent; explicit empty string selects `imageModel` as the top-level model; unused in standard Images mode
 - Image model: `gpt-image-2`
 - Image API quality: `imageQuality` defaults to `auto`; `low`, `medium`, and `high` are sent as the API `quality` value
 - The endpoint and model names above are defaults; the script can override them with CLI flags, `--api-profile`, or the local `defaultApi` / `apis` config
@@ -202,7 +205,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --recover-pending --outp
 - Auth: `Authorization: Bearer <API Key>`
 - Standard Images generation body: JSON with `model`, `prompt`, `size`, and optional `quality`
 - Standard Images edit body: multipart form with `model`, `prompt`, `size`, optional `quality`, and one `image` field per source image
-- Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; top-level `model` is `imageModel`, `tools[0].model` is omitted, and `tools[0].quality` is sent only for `low`, `medium`, or `high`; request mode uses background polling and does not automatically resubmit stream/plain fallback requests after a rejected or ambiguous background create
+- Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, and `store:false`; top-level `model` follows the `textModel` absent/non-empty/explicit-empty rules above, `tools[0].model` is `imageModel`, and `tools[0].quality` is sent only for `low`, `medium`, or `high`. Apply fallback only in Responses mode: start with background polling; if the background create returns any HTTP `4xx` or `5xx` without a response id, remove `background` and retry once with stream fallback. When the error response contains a response id, do not submit another generation request: consume a completed result, return an explicit terminal failure, or poll only processing/unknown status. During polling, continue after HTTP `408`, `409`, `425`, `429`, or `5xx`; stop immediately on other `4xx`. Do not retry on ambiguous create failures, and do not send a third plain request after this fallback
 - Response tracing: API requests temporarily write `*_trace.json` plus raw `*.raw.txt` files in the output directory; successful image saves delete the corresponding logs, and empty traces are removed. Failures with response ids or raw image outputs can be recovered with `--recover-trace` / `--recover-pending`; error-only traces are diagnostic records for cases where the upstream may have accepted the request but returned no recoverable id.
 - Responses result parsing: final image can come from background/plain JSON `image_generation_call.result`, SSE `response.output_item.done`, or the last partial image event as a fallback
 - Image saving accepts `b64_json`, `base64`, `image_generation_call.result`, common URL fields, nested `result.images`, and image links in Responses `output_text`; if one URL candidate cannot be downloaded, the script tries the next image candidate from the same response
