@@ -843,14 +843,6 @@ function createResponseTrace(outputDir, prefix, meta = {}) {
   };
 }
 
-function hasResponseTraceData(trace) {
-  return !!trace && (
-    (Array.isArray(trace.responseIds) && trace.responseIds.length > 0)
-    || (Array.isArray(trace.files) && trace.files.length > 0)
-    || (Array.isArray(trace.errors) && trace.errors.length > 0)
-  );
-}
-
 function hasRecoverableTraceData(trace) {
   return !!trace && (
     (Array.isArray(trace.responseIds) && trace.responseIds.length > 0)
@@ -899,7 +891,7 @@ function responseIdsFromRaw(raw) {
 
 function writeResponseTraceMetadata(trace) {
   if (!trace) return false;
-  if (!hasResponseTraceData(trace)) {
+  if (!hasRecoverableTraceData(trace)) {
     if (trace.metadataPath) {
       try {
         unlinkSync(trace.metadataPath);
@@ -961,7 +953,7 @@ function recordRawResponse(trace, stage, raw, meta = {}) {
 
 function responseTraceInfo(trace) {
   if (!trace) return {};
-  if (!hasResponseTraceData(trace)) {
+  if (!hasRecoverableTraceData(trace)) {
     deleteResponseTrace(trace);
     return {};
   }
@@ -2572,6 +2564,9 @@ async function runOpenAIStandardSelfTest() {
   }
   const emptyTrace = createResponseTrace(outputDir, "self_test_empty_trace");
   const emptyTraceInfo = responseTraceInfo(emptyTrace);
+  const errorOnlyTrace = createResponseTrace(outputDir, "self_test_error_only");
+  recordTraceError(errorOnlyTrace, new Error("mock error"));
+  const errorOnlyTraceInfo = responseTraceInfo(errorOnlyTrace);
   const rawOnlyTrace = createResponseTrace(outputDir, "self_test_raw_only", { outputPrefix: "raw_recover" });
   recordRawResponse(rawOnlyTrace, "images-generations", JSON.stringify({ data: [{ b64_json: pngB64 }] }), { route: "images", httpStatus: 200 });
   const rawOnlyRecover = await recoverResponseTrace(null, "https://example.com/v1/responses", rawOnlyTrace.metadataPath, { resize: false });
@@ -2596,13 +2591,14 @@ async function runOpenAIStandardSelfTest() {
     && !emptyTraceInfo.responseTracePath
     && !emptyTraceInfo.rawResponsePath
     && !existsSync(emptyTrace.metadataPath)
+    && !errorOnlyTraceInfo.responseTracePath
+    && !existsSync(errorOnlyTrace.metadataPath)
     && rawOnlyRecover?.ok
     && rawOnlyRecover.recoveredFromRaw
     && existsSync(rawOnlyRecover.path)
     && !existsSync(rawOnlyTrace.metadataPath)
     && !timeoutGenerateResult?.ok
-    && !!timeoutGenerateResult?.responseTracePath
-    && existsSync(timeoutGenerateResult.responseTracePath);
+    && !timeoutGenerateResult?.responseTracePath;
   const saved = await saveImageOutput(imageOutput, outputDir, "self_test_edit");
   const savedOk = !!saved?.path
     && existsSync(saved.path)

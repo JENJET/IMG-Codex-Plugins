@@ -386,7 +386,7 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --recover-pending --outp
 - 图生图默认走 `POST https://api.openai.com/v1/images/edits` multipart，参考图作为 `image` 字段上传
 - 设置 `imageRequestMode: "openai-responses"` 后，文生图和图生图都会走 `POST https://api.openai.com/v1/responses`
 - 仅 `openai-responses` 模式使用 fallback：请求先走 `background:true` + 轮询；如果 background 创建请求返回任意 HTTP `4xx` 或 `5xx` 且响应里没有 `responseId`，会移除 `background` 并切到 stream fallback 重试一次。响应里已有 `responseId` 时不重发生成请求：`completed` 直接消费结果，明确的失败状态立即返回失败，只有处理中或缺少状态时才使用该 ID 进入 GET 轮询。轮询仅对 HTTP `408/409/425/429` 和 `5xx` 暂时错误继续等待，其他 `4xx` 立即停止；创建请求超时或无响应时不重发，也不会继续发第三个 plain 请求
-- API 请求会临时记录 `*_trace.json` 和 `*.raw.txt`；成功保存图片后会删除对应日志，空 trace 会删除；失败且 trace 有 `responseIds` 或 raw 里已有图片输出时可用 `--recover-trace` / `--recover-pending` 恢复，只有错误信息的 trace 只用于判断“已提交但没有拿到 id”的不可恢复情况
+- API 响应中有 `responseIds` 或 raw 图片输出时，会临时记录 `*_trace.json` 和 `*.raw.txt`；成功保存图片后会删除对应日志，只有错误信息时不保存 trace；失败后保留下来的 trace 可用 `--recover-trace` / `--recover-pending` 恢复
 - Responses 顶层 `model` 默认使用 `textModel`（未配置时是 `gpt-5.5`）；显式配置 `textModel: ""` 时改用 `imageModel`；图片工具的 `model` 始终使用 `imageModel`
 - 图片模型默认是 `gpt-image-2`
 - 图片 API 质量默认是 `imageQuality: "auto"`；需要强制质量时可设为 `low`、`medium` 或 `high`
