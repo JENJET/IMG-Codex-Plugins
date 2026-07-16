@@ -121,7 +121,7 @@ Supported default 2K aspects are fixed to `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `16
 
 The preset `--ratio` / `--aspect` values `5:4`, `4:5`, `3:1`, and `1:3` are disabled in this plugin because repeated upstream tests returned `502` for them. Do not re-enable those preset ratio labels unless new real tests prove they are stable. Explicit `--size WIDTHxHEIGHT` remains allowed.
 
-Upstream may return a near-aspect image with non-exact pixels. On Windows, the script keeps the original upstream PNG, writes a center-cropped/resized copy beside it with a `_resized` suffix, and reports `resized from <original>` plus the original path. Resize is enabled by default for text-to-image, batch, and edit; pass `--no-resize` to keep the true upstream raster as the final output, or `--resize` to enable it explicitly.
+Upstream may return a near-aspect image with non-exact pixels. The script keeps that true upstream raster by default. Pass `--resize` to opt into local normalization; on Windows, the script then keeps the original upstream PNG, writes a center-cropped/resized copy beside it with a `_resized` suffix, and reports `resized from <original>` plus the original path. `--no-resize` and `--raw-output` remain accepted as explicit raw-output aliases.
 
 For same-prompt multi-image requests, use `--count 1..9`. For longer continuous runs, use `--repeat 1..50`. Each image is a separate API request:
 
@@ -209,7 +209,7 @@ node "$HOME/plugins/api-image-gen/scripts/generate.mjs" --recover-pending --outp
 - Response tracing: responses with response ids or raw image outputs temporarily write `*_trace.json` plus raw `*.raw.txt` files in the output directory; successful image saves delete the corresponding logs, and error-only traces are not saved. Failed traces that remain can be recovered with `--recover-trace` / `--recover-pending`.
 - Responses result parsing: final image can come from background/plain JSON `image_generation_call.result`, SSE `response.output_item.done`, or the last partial image event as a fallback
 - Image saving accepts `b64_json`, `base64`, `image_generation_call.result`, common URL fields, nested `result.images`, and image links in Responses `output_text`; if one URL candidate cannot be downloaded, the script tries the next image candidate from the same response
-- Saved PNG dimensions are normalized locally to the requested `size` unless `--no-resize` is used; when resize occurs, `path` points to the `_resized` copy and `originalPath` points to the retained upstream PNG
+- Saved PNGs preserve the upstream dimensions by default. With `--resize`, dimensions are normalized locally to the requested `size`; when resize occurs, `path` points to the `_resized` copy and `originalPath` points to the retained upstream PNG
 
 ## Verification
 

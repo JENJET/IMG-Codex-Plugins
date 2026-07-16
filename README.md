@@ -210,9 +210,9 @@ node "$HOME\plugins\api-image-gen\scripts\generate.mjs" --prompt "海报图" --q
 ~/Pictures/api-image-gen
 ```
 
-如果上游返回的 PNG 像素尺寸和请求尺寸不完全一致，脚本会保留原始上游图片，并在同目录另存一张带 `_resized` 后缀的调整后图片；命令输出里的 `Path` 指向调整后的图片，`original saved at` 指向保留的原图。
+如果上游返回的 PNG 像素尺寸和请求尺寸不完全一致，脚本默认保留上游返回的原始图片。显式开启尺寸调整后，脚本会在同目录另存一张带 `_resized` 后缀的调整后图片；命令输出里的 `Path` 指向调整后的图片，`original saved at` 指向保留的原图。
 
-尺寸调整默认开启。需要关闭时，在文生图、批量出图或图生图命令后加 `--no-resize`；需要显式开启时可加 `--resize`。
+尺寸调整默认关闭。需要开启时，在文生图、批量出图、图生图或恢复命令后加 `--resize`。`--no-resize` 和 `--raw-output` 仍可用于显式要求保留上游原图。
 
 ### 1. 文生图
 

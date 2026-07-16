@@ -105,6 +105,7 @@ const DEFAULTS = {
   ratio: "1:1",
   count: 1,
   concurrency: 3,
+  resize: false,
 };
 const DEFAULT_ENABLED_QUALITIES = new Set(["1K", "2K"]);
 const SUPPORTED_IMAGE_REQUEST_MODES = new Set(["openai", "openai-responses"]);
@@ -1042,7 +1043,7 @@ function loadResponseTraceForRecovery(tracePath, options = {}) {
     files,
     errors: Array.isArray(data?.errors) ? data.errors : [],
     outputPrefix: outputPrefixForTrace(data, tracePath),
-    targetSize: options.resize === false ? null : normalizeSizeString(data?.targetSize),
+    targetSize: options.resize === true ? normalizeSizeString(data?.targetSize) : null,
   };
   return { ok: true, trace };
 }
@@ -1920,7 +1921,7 @@ async function postOpenAIImagesMultipart(apiKey, url, formData, trace = null) {
 }
 
 async function generateImageViaResponses(apiKey, prompt, size, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize ?? DEFAULTS.resize;
   const apiConfig = options.apiConfig || resolveApiConfig();
   const trace = createResponseTrace(outputDir, "response_generate", { outputPrefix: "img", targetSize: resize ? size : null });
   const start = Date.now();
@@ -1950,7 +1951,7 @@ async function generateImageViaResponses(apiKey, prompt, size, outputDir, option
 }
 
 async function generateImageViaImages(apiKey, prompt, size, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize ?? DEFAULTS.resize;
   const apiConfig = options.apiConfig || resolveApiConfig();
   const trace = createResponseTrace(outputDir, "images_generate", { outputPrefix: "img", targetSize: resize ? size : null });
   const start = Date.now();
@@ -2028,7 +2029,7 @@ function loadSourceImages(imagePaths) {
 }
 
 async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize ?? DEFAULTS.resize;
   const apiConfig = options.apiConfig || resolveApiConfig();
   const trace = createResponseTrace(outputDir, "response_edit", { outputPrefix: "edit", targetSize: resize ? size : null });
   const start = Date.now();
@@ -2061,7 +2062,7 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
 }
 
 async function editImageViaImagesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize ?? DEFAULTS.resize;
   const apiConfig = options.apiConfig || resolveApiConfig();
   const trace = createResponseTrace(outputDir, "images_edit", { outputPrefix: "edit", targetSize: resize ? size : null });
   const start = Date.now();
@@ -2092,7 +2093,7 @@ async function editImageViaImagesOnce(apiKey, sources, prompt, size, outputDir, 
 }
 
 async function editImage(apiKey, imagePaths, prompt, size, outputDir, count = 1, silent = false, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize ?? DEFAULTS.resize;
   const paths = Array.isArray(imagePaths) ? imagePaths : [imagePaths];
   const sourceGroup = loadSourceImages(paths);
   if (!sourceGroup.ok) return sourceGroup;
@@ -2164,7 +2165,7 @@ async function generateWithRetry(apiKey, prompt, size, outputDir, options = {}) 
     maxRetries = MAX_RETRIES,
     retryDelayMs = RETRY_BACKOFF_MS,
     generator = generateImage,
-    resize = true,
+    resize = DEFAULTS.resize,
     apiConfig = resolveApiConfig(),
     onRetryableFailure = () => {},
   } = options;
@@ -2199,7 +2200,7 @@ async function runBatch(apiKey, prompts, size, concurrency, outputDir, options =
     maxRetries = MAX_RETRIES,
     retryDelayMs = RETRY_BACKOFF_MS,
     generator = generateImage,
-    resize = true,
+    resize = DEFAULTS.resize,
     returnReport = false,
     apiConfig = resolveApiConfig(),
   } = options;
@@ -2543,14 +2544,18 @@ async function runOpenAIStandardSelfTest() {
     };
     generateResult = await generateImage("mock-key", "mock generate prompt", "2048x1024", outputDir, {
       apiConfig: testApiConfig,
-      resize: false,
     });
     editResult = await editImageViaImagesOnce("mock-key", sources, "mock edit prompt", "1152x2048", outputDir, {
       apiConfig: testApiConfig,
-      resize: false,
     });
     requestOk = generateResult.ok
       && editResult.ok
+      && generateResult.width === 1
+      && generateResult.height === 1
+      && !generateResult.resized
+      && editResult.width === 1
+      && editResult.height === 1
+      && !editResult.resized
       && fetchCalls.length === 2
       && fetchCalls[0].url.endsWith("/v1/images/generations")
       && fetchCalls[0].body?.model === apiConfig.imageModel
@@ -3016,20 +3021,20 @@ CONFIG
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--api-profile NAME] [--api-root URL] [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_GENERATION_COUNT}] [--resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
-  --batch prompts.json [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
-  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
+  --batch prompts.json [--ratio R|--aspect R|--size WxH] [--concurrency N] [--resize]
+  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R|--size WxH] [--concurrency N] [--resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]
-  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--no-resize]    combine all sources in one edit request
-  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--concurrency N] [--no-resize]
+  --edit --image path.png --prompt "..." [--image-request-mode openai|openai-responses] [--text-model MODEL] [--image-quality auto|low|medium|high] [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--resize]
+  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--count 1..${MAX_EDIT_COUNT}] [--resize]    combine all sources in one edit request
+  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R|--size WxH] [--concurrency N] [--resize]
   default route is OpenAI standard Images API; use --edit-api responses for Responses/RS
 
 RECOVER
-  --recover-trace path_to_trace.json [--api-profile NAME] [--no-resize]
-  --recover-pending [--output-dir DIR] [--api-profile NAME] [--no-resize]
+  --recover-trace path_to_trace.json [--api-profile NAME] [--resize]
+  --recover-pending [--output-dir DIR] [--api-profile NAME] [--resize]
 
 TOOLS
   --resolve-size --quality 2K --aspect 16:9
@@ -3052,6 +3057,7 @@ DEFAULTS
   size preset: default ${DEFAULTS.quality}; supported ${Object.keys(sizeMatrix).join(", ")}
   output: ~/Pictures/api-image-gen
   adaptive: on, concurrency ${DEFAULTS.concurrency}, retries ${MAX_RETRIES}, retry backoff ${RETRY_BACKOFF_MS / 1000}s
+  resize: ${DEFAULTS.resize ? "on" : "off"} (use --resize to enable)
   notice: ${API_SIZE_LIMIT_NOTICE}
 
 RATIOS
@@ -3098,6 +3104,7 @@ function resolveGenerationParams(flags, modeConfig, sizeMatrix = resolveSizeMatr
 
 async function main() {
   const { prompts, flags } = parseArgs(process.argv.slice(2));
+  const resize = flags.resize ?? DEFAULTS.resize;
   const configPath = resolveConfigPath(flags);
   const config = loadConfig(configPath) || {};
   if (flags.imageRequestMode != null && !normalizeImageRequestMode(flags.imageRequestMode)) {
@@ -3233,7 +3240,7 @@ async function main() {
     const apiKey = resolveApiKey(flags, config);
     const results = await runRecoverResponseTraces(apiKey, apiConfig.responsesUrl, tracePaths, {
       outputDir: flags.recoverTrace && flags.outputDir ? recoverDir : null,
-      resize: flags.resize !== false,
+      resize,
     });
     const recovered = results.filter((item) => item.ok);
     const notRecovered = results.filter((item) => !item.ok && !item.skipped);
@@ -3290,14 +3297,14 @@ async function main() {
     if (images.length > 1 && flags.batchEdit) {
       const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
       process.exitCode = await runBatchEdit(apiKey, images, prompts[0], size, concurrency, outputDir, {
-        resize: flags.resize !== false,
+        resize,
         apiConfig,
       });
       return;
     }
     const count = clampInteger(flags.count, 1, MAX_EDIT_COUNT, 1);
     const result = await editImage(apiKey, images, prompts[0], size, outputDir, count, false, {
-      resize: flags.resize !== false,
+      resize,
       apiConfig,
     });
     if (!result.ok) {
@@ -3352,7 +3359,7 @@ async function main() {
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
     process.exit(await runBatch(apiKey, batchPrompts.map(String), size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
-      resize: flags.resize !== false,
+      resize,
       apiConfig,
     }));
   }
@@ -3365,7 +3372,7 @@ async function main() {
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
     process.exit(await runBatch(apiKey, prompts, size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
-      resize: flags.resize !== false,
+      resize,
       apiConfig,
     }));
   }
@@ -3379,14 +3386,14 @@ async function main() {
     process.exit(await runBatch(apiKey, Array(total).fill(prompt), size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
       isVariation: true,
-      resize: flags.resize !== false,
+      resize,
       apiConfig,
     }));
   }
 
   console.log("Generating...");
   const result = await generateImage(apiKey, prompt, size, outputDir, {
-    resize: flags.resize !== false,
+    resize,
     apiConfig,
   });
   if (!result.ok) {

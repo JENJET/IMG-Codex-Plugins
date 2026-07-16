@@ -5,6 +5,7 @@ param(
   [string]$NodeScript = "$HOME\plugins\api-image-gen\scripts\generate.mjs",
   [string]$OutputRoot = "$HOME\Pictures\api-image-gen\matrix-tests",
   [string]$OnlyQuality = "2K",
+  [switch]$Resize,
   [switch]$NoResize
 )
 
@@ -16,6 +17,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 $resultsJsonl = Join-Path $outputDir "matrix_results.jsonl"
 $summaryJson = Join-Path $outputDir "matrix_summary.json"
 $contactSheet = Join-Path $outputDir "matrix_contact_sheet.png"
+$shouldResize = [bool]$Resize -and -not [bool]$NoResize
 
 $matrix = @(
   [pscustomobject]@{ Index=1; Quality="1K"; Aspect="1:1"; Size="1024x1024" },
@@ -99,7 +101,7 @@ function Test-PngFile {
 }
 
 $jobScript = {
-  param($NodeScript, $Prompt, $OutputDir, $Item, $MaxRetries, $NoResize)
+  param($NodeScript, $Prompt, $OutputDir, $Item, $MaxRetries, $Resize)
 
   function Test-PngFileInner {
     param([string]$Path, [string]$ExpectedSize)
@@ -132,7 +134,7 @@ $jobScript = {
   while ($attempt -lt $maxAttempts) {
     $attempt += 1
     $nodeArgs = @($NodeScript, "--prompt", $Prompt, "--quality", $Item.Quality, "--aspect", $Item.Aspect, "--output-dir", $OutputDir)
-    if ($NoResize) { $nodeArgs += "--no-resize" }
+    if ($Resize) { $nodeArgs += "--resize" }
     $output = & node @nodeArgs 2>&1
     $exitCode = $LASTEXITCODE
     $text = ($output | Out-String).Trim()
@@ -150,7 +152,7 @@ $jobScript = {
         Quality=$Item.Quality
         Aspect=$Item.Aspect
         ExpectedSize=$Item.Size
-        Ok=($validation.Exists -and $validation.PngSignature -and ($NoResize -or $validation.DimensionsOk))
+        Ok=($validation.Exists -and $validation.PngSignature -and (-not $Resize -or $validation.DimensionsOk))
         Attempts=$attempt
         Retries=($attempt - 1)
         Path=$path
@@ -242,13 +244,13 @@ foreach ($item in $matrix) { $queue.Enqueue($item) }
 $running = @()
 $results = @()
 
-Write-Host "Matrix test started: prompt=$Prompt, total=$($matrix.Count), concurrency=$Concurrency, noResize=$NoResize, output=$outputDir"
+Write-Host "Matrix test started: prompt=$Prompt, total=$($matrix.Count), concurrency=$Concurrency, resize=$shouldResize, output=$outputDir"
 
 while ($queue.Count -gt 0 -or $running.Count -gt 0) {
   while ($queue.Count -gt 0 -and $running.Count -lt $Concurrency) {
     $item = $queue.Dequeue()
     Write-Host ("START {0}/{1} {2} {3} {4}" -f $item.Index, $matrix.Count, $item.Quality, $item.Aspect, $item.Size)
-    $job = Start-Job -ScriptBlock $jobScript -ArgumentList $NodeScript, $Prompt, $outputDir, $item, $MaxRetries, [bool]$NoResize
+    $job = Start-Job -ScriptBlock $jobScript -ArgumentList $NodeScript, $Prompt, $outputDir, $item, $MaxRetries, $shouldResize
     $running += [pscustomobject]@{ Job=$job; Item=$item }
   }
   if ($running.Count -eq 0) { continue }
@@ -280,7 +282,7 @@ $summary = [pscustomobject]@{
   Success=$ok.Count
   Failed=$failed.Count
   RetryCount=($results | Measure-Object -Property Retries -Sum).Sum
-  NoResize=[bool]$NoResize
+  Resize=$shouldResize
   AllPng=($results.PngSignature -notcontains $false)
   AllDimensionsOk=($results.DimensionsOk -notcontains $false)
   OutputDir=$outputDir
